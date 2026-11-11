@@ -133,7 +133,7 @@ export default function AdminDashboardSection({ onNavigate, role, userEmail }: A
   return (
     <Page
       eyebrow="Council dashboard"
-      title={`${greeting()} 👋`}
+      title={greeting()}
       subtitle={`${userEmail} — your council ${ROLE_FOCUS[role]} overview.`}
       actions={
         <div className="glass flex items-center gap-3 rounded-full py-1.5 pl-1.5 pr-5">
