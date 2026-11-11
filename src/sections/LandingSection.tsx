@@ -246,7 +246,7 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
 
 function Segment({ id, label, divided, children }: { id: string; label: string; divided?: boolean; children: ReactNode }) {
   return (
-    <div className={cn("rounded-full px-5 py-2.5 transition focus-within:bg-surface-2", divided && "sm:border-l sm:border-line sm:rounded-none sm:focus-within:rounded-full")}>
+    <div className={cn("rounded-2xl px-5 py-2.5 transition focus-within:bg-surface-2 sm:rounded-full", divided && "sm:rounded-none sm:border-l sm:border-line sm:focus-within:rounded-full")}>
       <label htmlFor={id} className="block text-[11px] font-bold uppercase tracking-wider text-ink">
         {label}
       </label>
