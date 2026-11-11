@@ -79,28 +79,25 @@ The project includes functionality for:
 
 ## 📁 Project Structure
 
-A simplified structure of the project:
-
 ```text
-Digital-Transparence-Board/
-│
-├── public/                 # Static assets
-├── src/
-│   ├── components/        # Reusable UI components
-│   ├── pages/             # Application pages
-│   ├── lib/               # Utilities and configurations
-│   └── ...
-│
-├── supabase/              # Supabase-related configuration/functions
-│
-├── .env.example           # Example environment configuration
-├── .gitignore             # Git exclusions
-├── package.json           # Project dependencies and scripts
-├── package-lock.json      # Locked dependency versions
-├── vite.config.ts         # Vite configuration
-├── tsconfig.json          # TypeScript configuration
-└── README.md              # Project documentation
+src/
+├── App.tsx              # View routing + auth/session wiring
+├── index.css            # Design system (tokens, cards, buttons, inputs, chips)
+├── sections/            # One file per page (public + staff)
+├── components/
+│   ├── ui/              # Shared primitives — see components/ui/README.md
+│   └── *.tsx            # Domain components (QR, receipts, notifications…)
+├── hooks/               # useSearch, usePagination, useTheme, useSpreadsheetImport
+├── services/            # Supabase data access (db, auth, notifications)
+├── lib/                 # Pure helpers (format, roles, receipts, qr, offline sync…)
+└── types/               # Shared domain types
+supabase/                # SQL schema, migrations, edge function (send-push)
+scripts/                 # Admin maintenance scripts (service-role key)
+public/                  # Static assets + service worker (sw.js)
 ```
+
+UI conventions (tokens, classes, components) are documented in
+[`src/components/ui/README.md`](src/components/ui/README.md).
 
 ---
 
