@@ -103,7 +103,7 @@ export default function AdminDashboardSection({ onNavigate, role, userEmail }: A
       setData({
         report,
         studentCount: students.length,
-        upcoming: events.filter((e) => e.date && e.date >= now).sort((a, b) => a.date.localeCompare(b.date)),
+        upcoming: events.filter((e) => e.date && e.date >= now).sort((a, b) => (a.date ?? "").localeCompare(b.date ?? "")),
         pendingFeedback: pending.length,
         transactions: transactions.slice(0, 5),
       });
@@ -173,9 +173,10 @@ export default function AdminDashboardSection({ onNavigate, role, userEmail }: A
             ) : (
               <ul className="max-h-72 space-y-2 overflow-y-auto">
                 {upcoming.map((event) => {
-                  const days = daysUntil(event.date);
+                  const date = event.date ?? ""; // always set: filtered above
+                  const days = daysUntil(date);
                   return (
-                    <Row key={event.id} title={event.name} meta={`${formatDate(event.date)} · Allocation ${formatPeso(event.allocationAmount)}`}>
+                    <Row key={event.id} title={event.name} meta={`${formatDate(date)} · Allocation ${formatPeso(event.allocationAmount)}`}>
                       <span className={cn("chip", days <= 0 ? "chip-danger" : "chip-success")}>{days <= 0 ? "Today" : `${days}d`}</span>
                     </Row>
                   );

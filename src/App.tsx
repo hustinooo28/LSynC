@@ -158,7 +158,7 @@ function App() {
       case "inquiry":
       case "complaint":
       case "suggestion":
-        return <FeedbackSection defaultTab={view} />;
+        return <FeedbackSection key={view} defaultTab={view} />;
       case "admin-login":
       case "admin-dashboard":
         return auth ? (

@@ -16,7 +16,7 @@ import Field from "@/components/ui/Field";
 import EmptyState from "@/components/ui/EmptyState";
 import SearchInput from "@/components/ui/SearchInput";
 import Pagination from "@/components/ui/Pagination";
-import Skeleton, { LoadingCard } from "@/components/ui/Skeleton";
+import { LoadingCard } from "@/components/ui/Skeleton";
 import { Menu, MenuContent, MenuItem, MenuSeparator, RowActionsTrigger } from "@/components/ui/Menu";
 
 interface TransparencyBoardSectionProps {
