@@ -710,7 +710,7 @@ export const studentRequirementFilesService = {
 
   /** Published files this student may see (open + restricted-with-access), resolved server-side. */
   getVisibleForStudent: (studentId: string) =>
-    cachedQuery(
+    cachedQuery<StudentRequirementFile>(
       "student_requirement_files",
       async () => ((await unwrap(sb().rpc("get_student_requirement_files", { p_student_id: studentId }))) ?? []).map(files.fromRow),
       // Offline we can't check access lists, so only show open published files.
@@ -766,7 +766,7 @@ export const studentRequirementFilesService = {
       createdAt: now,
       updatedAt: now,
     };
-    const payload = { ...files.toRow(local), description: input.description ?? "", file_url: "" };
+    const payload: Row = { ...files.toRow(local), description: input.description ?? "", file_url: "" };
     delete payload.restricted;
 
     const result = await offlineSyncService.mutation<StudentRequirementFile>({
