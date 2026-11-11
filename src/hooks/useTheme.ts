@@ -1,74 +1,29 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 export type Theme = "light" | "dark";
+const KEY = "dssc-theme"; // also read by the inline script in index.html
 
-export const THEME_STORAGE_KEY = "dssc-theme";
-
-function getSystemTheme(): Theme {
-  return typeof window !== "undefined" &&
-    window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
-}
-
-function getInitialTheme(): Theme {
-  if (typeof window !== "undefined") {
-    try {
-      const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
-      if (savedTheme === "light" || savedTheme === "dark") {
-        return savedTheme;
-      }
-    } catch {
-      // A blocked storage area should not prevent the app from rendering.
-    }
-  }
-
-  return getSystemTheme();
-}
-
-function applyTheme(theme: Theme): void {
-  document.documentElement.dataset.theme = theme;
-  document.documentElement.style.colorScheme = theme;
-}
+const initial = (): Theme =>
+  (document.documentElement.dataset.theme as Theme) ??
+  (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 
 export function useTheme() {
-  const [theme, setTheme] = useState<Theme>(getInitialTheme);
+  const [theme, setTheme] = useState<Theme>(initial);
 
   useEffect(() => {
-    applyTheme(theme);
+    document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  useEffect(() => {
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-
-    const handleSystemThemeChange = (event: MediaQueryListEvent) => {
-      let hasManualTheme = false;
+  const toggleTheme = () =>
+    setTheme((t) => {
+      const next = t === "dark" ? "light" : "dark";
       try {
-        hasManualTheme = Boolean(window.localStorage.getItem(THEME_STORAGE_KEY));
+        localStorage.setItem(KEY, next);
       } catch {
-        // Continue using the system preference when storage is unavailable.
+        /* storage blocked — theme still applies for this session */
       }
-
-      if (!hasManualTheme) {
-        setTheme(event.matches ? "dark" : "light");
-      }
-    };
-
-    mediaQuery.addEventListener("change", handleSystemThemeChange);
-    return () => mediaQuery.removeEventListener("change", handleSystemThemeChange);
-  }, []);
-
-  const toggleTheme = useCallback(() => {
-    setTheme((currentTheme) => {
-      const nextTheme: Theme = currentTheme === "dark" ? "light" : "dark";
-      try {
-        window.localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
-      } catch {
-        // The selected theme still applies for this session without storage.
-      }
-      return nextTheme;
+      return next;
     });
-  }, []);
 
   return { theme, toggleTheme };
 }

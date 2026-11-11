@@ -44,7 +44,7 @@ import SectionLoader from "@/components/SectionLoader";
 import Skeleton from "@/components/Skeleton";
 import SectionEmptyState from "@/components/SectionEmptyState";
 import SectionBackButton from "@/components/SectionBackButton";
-import TimeInput12 from "@/features/events/TimeInput12";
+import TimeInput12 from "@/components/TimeInput12";
 import ConfirmDialog from "@/components/common/ConfirmDialog";
 
 interface EventManagementSectionProps {

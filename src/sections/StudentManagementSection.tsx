@@ -34,7 +34,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
 import { pickField } from "@/lib/spreadsheet";
-import { ATTENDANCE_COURSES } from "@/lib/kmeans";
+import { PROGRAMS } from "@/lib/constants";
 import { useSearch } from "@/hooks/useSearch";
 import { useSpreadsheetImport } from "@/hooks/useSpreadsheetImport";
 interface StudentManagementSectionProps {
@@ -625,7 +625,7 @@ export default function StudentManagementSection({
                 disabled={saving}
               />
               <datalist id="program-suggestions">
-                {ATTENDANCE_COURSES.map((course) => (
+                {PROGRAMS.map((course) => (
                   <option key={course} value={course} />
                 ))}
               </datalist>

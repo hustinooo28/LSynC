@@ -38,8 +38,8 @@ import { useSectionEntrance } from "@/hooks/useSectionEntrance";
 import SectionLoader from "@/components/SectionLoader";
 import SectionEmptyState from "@/components/SectionEmptyState";
 import SectionBackButton from "@/components/SectionBackButton";
-import TimeInput12 from "@/features/events/TimeInput12";
-import AttendanceAnalysisChart from "@/features/events/AttendanceAnalysisChart";
+import TimeInput12 from "@/components/TimeInput12";
+import AttendanceAnalysisChart from "@/components/AttendanceAnalysisChart";
 import ConfirmDialog from "@/components/common/ConfirmDialog";
 import Pagination from "@/components/common/Pagination";
 

@@ -341,7 +341,7 @@ export default function AdminDashboardSection({
 
             <div className="mt-3 flex items-center gap-3">
               <img
-                src="/DSSC_logo.png"
+                src="/DSSC-logo.png"
                 alt="DSSC logo"
                 className="h-12 w-12 rounded-full border-2 border-lsc-gold/60 bg-white object-contain p-1"
               />
