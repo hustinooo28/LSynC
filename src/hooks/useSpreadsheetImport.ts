@@ -4,31 +4,11 @@ import readXlsxFile from "read-excel-file/browser";
 import { parseCsv, excelRowsToRecords } from "@/lib/spreadsheet";
 
 /**
- * Shared CSV / Excel import shell used by the management sections.
- *
- * This hook extracts the duplicated file-reading flow that previously lived in
- * both StudentManagementSection and ContributionManagementSection:
- *   - grab the selected file and reset the input value so the same file can be
- *     re-selected,
- *   - validate the extension (.csv / .xlsx),
- *   - parse the file into header-keyed row objects (CSV or Excel),
- *   - delegate those rows to the section's own `onRows` importer,
- *   - manage the `importing` loading state and surface any parse/read error.
- *
- * It intentionally does NOT contain any row-mapping, deduping, persistence, or
- * success/`skipped` accounting logic — each section keeps its own importer so
- * the two (genuinely different) data shapes and rules stay intact. Only the
- * identical file-read shell is shared here.
+ * Shared .csv / .xlsx file-read shell: validates the file, parses it (every
+ * sheet of a workbook) into header-keyed rows and hands them to `onRows`,
+ * which owns mapping, dedupe, persistence and result toasts.
  */
-export function useSpreadsheetImport(options: {
-  /** Per-section importer that maps, dedupes, persists, and reports its own results. */
-  onRows: (rows: Record<string, string>[]) => Promise<void>;
-}): {
-  importing: boolean;
-  handleFileSelected: (e: ChangeEvent<HTMLInputElement>) => Promise<void>;
-  importInputRef: React.RefObject<HTMLInputElement | null>;
-} {
-  const { onRows } = options;
+export function useSpreadsheetImport({ onRows }: { onRows: (rows: Record<string, string>[]) => Promise<void> }) {
   const [importing, setImporting] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
 
@@ -37,45 +17,23 @@ export function useSpreadsheetImport(options: {
     e.target.value = ""; // allow re-selecting the same file
     if (!file) return;
 
-    const isCsv = file.name.toLowerCase().endsWith(".csv");
-    const isExcel = file.name.toLowerCase().endsWith(".xlsx");
-    if (!isCsv && !isExcel) {
+    const name = file.name.toLowerCase();
+    const isCsv = name.endsWith(".csv");
+    if (!isCsv && !name.endsWith(".xlsx")) {
       toast.error("Please upload a .csv or .xlsx file");
       return;
     }
 
+    const kind = isCsv ? "CSV" : "Excel";
+    setImporting(true);
     try {
-      setImporting(true);
-      let rows: Record<string, string>[];
-
-if (isCsv) {
-  rows = parseCsv(await file.text());
-} else {
-  const sheets = await readXlsxFile(file);
-
-  const allRows: Record<string, string>[] = [];
-
-  for (const sheet of sheets) {
-    const sheetRows = sheet.data;
-
-    if (!sheetRows || sheetRows.length < 2) {
-      continue;
-    }
-
-    const records = excelRowsToRecords(sheetRows);
-
-    if (records.length > 0) {
-      allRows.push(...records);
-    }
-  }
-
-  rows = allRows;
-}
-
-await onRows(rows);
+      const rows = isCsv
+        ? parseCsv(await file.text())
+        : (await readXlsxFile(file)).flatMap((sheet) => excelRowsToRecords(sheet.data ?? []));
+      await onRows(rows);
     } catch (error) {
-      console.error(`Error importing ${isCsv ? "CSV" : "Excel"} file:`, error);
-      toast.error(`Failed to import ${isCsv ? "CSV" : "Excel"} file`);
+      console.error(`Error importing ${kind} file:`, error);
+      toast.error(`Failed to import ${kind} file`);
     } finally {
       setImporting(false);
     }

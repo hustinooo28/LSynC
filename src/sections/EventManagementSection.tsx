@@ -1,405 +1,163 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import {
-  Calendar,
-  Plus,
-  Save,
-  UserCheck,
-  Pencil,
-  Trash2,
-  MoreVertical,
-  Loader2,
-} from "lucide-react";
-import {
-  eventsService,
-  studentsService,
-  contributionsService,
-  boardMembersService,
-  subscribeToTables,
-} from "@/services/db";
-import { notificationsService } from "@/services/notificationsService";
-import type {
-  Event,
-  EventSchedule,
-  EventSession,
-  Student,
-  UserRole,
-  BoardMember,
-} from "@/types";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import {
-  formatDate,
-  daysUntil,
-  today,
-  formatTimeRange,
-  formatPeso,
-} from "@/lib/format";
-import { useSectionEntrance } from "@/hooks/useSectionEntrance";
-import SectionLoader from "@/components/SectionLoader";
-import Skeleton from "@/components/Skeleton";
-import SectionEmptyState from "@/components/SectionEmptyState";
-import SectionBackButton from "@/components/SectionBackButton";
+import { Calendar, CalendarClock, ClipboardCheck, Clock, CloudSun, Moon, Pencil, Plus, Sun, Trash2, Users, Wallet } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import { eventsService, studentsService, contributionsService, subscribeToTables } from "@/services/db";
+import { notificationsService } from "@/services/notificationsService";
+import type { Event, EventSchedule, EventSession, UserRole } from "@/types";
+import { formatDate, daysUntil, formatTimeRange, formatPeso } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import Page from "@/components/ui/Page";
+import Modal from "@/components/ui/Modal";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import Field from "@/components/ui/Field";
+import StatCard from "@/components/ui/StatCard";
+import EmptyState from "@/components/ui/EmptyState";
+import Skeleton from "@/components/ui/Skeleton";
+import { Menu, MenuContent, MenuItem, MenuSeparator, RowActionsTrigger } from "@/components/ui/Menu";
 import TimeInput12 from "@/components/TimeInput12";
-import ConfirmDialog from "@/components/common/ConfirmDialog";
 
 interface EventManagementSectionProps {
   onBack: () => void;
   role: UserRole;
-  staffName: string;
-  userId?: string;
 }
 
-export default function EventManagementSection({
-  onBack,
-  role,
-}: EventManagementSectionProps) {
+const SESSIONS: Record<EventSession, { label: string; icon: LucideIcon }> = {
+  morning: { label: "Morning", icon: Sun },
+  afternoon: { label: "Afternoon", icon: CloudSun },
+  evening: { label: "Evening", icon: Moon },
+};
+
+type EventForm = {
+  name: string;
+  allocationAmount: number;
+  date: string;
+  tbd: boolean;
+  contributionDeadline: string;
+  schedules: EventSchedule[];
+};
+
+const EMPTY_FORM: EventForm = { name: "", allocationAmount: 0, date: "", tbd: false, contributionDeadline: "", schedules: [] };
+
+const isTbd = (e: Event) => !e.date || e.date === "TBD";
+
+/** "Today" / "In 3d" / "Overdue" style chip for a date relative to now. */
+function dueChip(date: string, pastLabel: string) {
+  const d = daysUntil(date);
+  if (d < 0) return { label: pastLabel, tone: pastLabel === "Overdue" ? "chip-danger" : "chip-neutral" };
+  if (d === 0) return { label: "Today", tone: "chip-danger" };
+  return { label: `In ${d}d`, tone: d <= 7 ? "chip-warning" : "chip-success" };
+}
+
+export default function EventManagementSection({ onBack, role }: EventManagementSectionProps) {
   const [events, setEvents] = useState<Event[]>([]);
-  const [students, setStudents] = useState<Student[]>([]);
-  const [eventTotals, setEventTotals] = useState<Record<string, number>>({});
-  const [boardMembers, setBoardMembers] = useState<BoardMember[]>([]);
+  const [studentCount, setStudentCount] = useState(0);
+  const [collected, setCollected] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // Role-based permissions
-  const canManageEvents = role === "admin" || role === "board-member";
+  // `editing`: null = closed, "new" = create, Event = edit.
+  const [editing, setEditing] = useState<Event | "new" | null>(null);
+  const [form, setForm] = useState<EventForm>(EMPTY_FORM);
+  const [sessionToAdd, setSessionToAdd] = useState<EventSession | "">("");
+  const [toDelete, setToDelete] = useState<Event | null>(null);
+  const [evaluating, setEvaluating] = useState<Event | null>(null);
+  const [formUrl, setFormUrl] = useState("");
 
-  // Three-dot action menu
-  const [openActionMenu, setOpenActionMenu] = useState<string | null>(null);
-
-  // Event form
-  const [showEventModal, setShowEventModal] = useState(false);
-  const [editingEvent, setEditingEvent] = useState<Event | null>(null);
-
-  // Delete confirmation dialog state
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [eventToDelete, setEventToDelete] = useState<Event | null>(null);
-
-  // Evaluation rollout dialog state
-  const [evaluationTarget, setEvaluationTarget] = useState<Event | null>(null);
-  const [evaluationFormUrlInput, setEvaluationFormUrlInput] = useState("");
-  const [savingEvaluation, setSavingEvaluation] = useState(false);
-
-  const [eventForm, setEventForm] = useState<{
-    name: string;
-    allocationAmount: number;
-    date: string;
-    contributionDeadline: string;
-    schedules: EventSchedule[];
-  }>({
-    name: "",
-    allocationAmount: 0,
-    date: "",
-    contributionDeadline: "",
-    schedules: [],
-  });
-
-  const [scheduleToAdd, setScheduleToAdd] = useState<EventSession | "">("");
-  const [eventDateTbd, setEventDateTbd] = useState(false);
-
-  const sectionRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
+  const canManage = role === "admin" || role === "board-member";
 
   const loadData = useCallback(async (showLoader = true) => {
+    if (showLoader) setLoading(true);
     try {
-      if (showLoader) {
-        setLoading(true);
-      }
-
-      const [eventsData, studentsData, totalsData] = await Promise.all([
+      const [eventsData, students, totals] = await Promise.all([
         eventsService.getAll(),
         studentsService.getAll(),
         contributionsService.getTotalsByEvent(),
       ]);
-
       setEvents(eventsData);
-      setStudents(studentsData);
-      setEventTotals(totalsData);
-
-      try {
-        setBoardMembers(await boardMembersService.listBoardMembers());
-      } catch (membersError) {
-        console.warn("Could not load board members:", membersError);
-        setBoardMembers([]);
-      }
+      setStudentCount(students.length);
+      setCollected(totals);
     } catch (error) {
       console.error("Error loading data:", error);
       toast.error("Failed to load data");
     } finally {
-      if (showLoader) {
-        setLoading(false);
-      }
+      if (showLoader) setLoading(false);
     }
   }, []);
 
-  // Initial read
   useEffect(() => {
     loadData();
+    return subscribeToTables(["events", "students", "contributions"], () => loadData(false), "event-management");
   }, [loadData]);
 
-  // Live updates
-  useEffect(() => {
-    return subscribeToTables(
-      ["events", "students", "contributions", "board_members"],
-      () => loadData(false),
-      "event-management",
-    );
-  }, [loadData]);
-
-  useSectionEntrance(sectionRef, [
-    {
-      ref: contentRef,
-      from: { y: "6vh", opacity: 0 },
-      to: { y: 0, opacity: 1, duration: 0.5, ease: "power2.out" },
-    },
-  ]);
-
-  const addSchedule = () => {
-    if (!scheduleToAdd) return;
-
-    const alreadyExists = eventForm.schedules.some(
-      (schedule) => schedule.period === scheduleToAdd,
-    );
-
-    if (alreadyExists) {
-      toast.error("This schedule has already been added");
-      return;
-    }
-
-    setEventForm((prev) => ({
-      ...prev,
-      schedules: [
-        ...prev.schedules,
-        {
-          period: scheduleToAdd,
-          timeInEnabled: true,
-          timeOutEnabled: true,
-          timeIn: "",
-          timeOut: "",
-        },
-      ],
-    }));
-
-    setScheduleToAdd("");
-  };
-
-  const removeSchedule = (period: EventSession) => {
-    setEventForm((prev) => ({
-      ...prev,
-      schedules: prev.schedules.filter(
-        (schedule) => schedule.period !== period,
+  // Dated events soonest first, then TBD events alphabetically.
+  const sortedEvents = useMemo(
+    () =>
+      [...events].sort((a, b) =>
+        isTbd(a) !== isTbd(b) ? (isTbd(a) ? 1 : -1) : isTbd(a) ? a.name.localeCompare(b.name) : a.date!.localeCompare(b.date!),
       ),
-    }));
+    [events],
+  );
+
+  const replaceEvent = (id: string, patch: Partial<Event>) => setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  const patchForm = (patch: Partial<EventForm>) => setForm((prev) => ({ ...prev, ...patch }));
+  const updateSchedule = (period: EventSession, patch: Partial<EventSchedule>) =>
+    patchForm({ schedules: form.schedules.map((s) => (s.period === period ? { ...s, ...patch } : s)) });
+
+  const openForm = (event?: Event) => {
+    setEditing(event ?? "new");
+    setSessionToAdd("");
+    setForm(
+      event
+        ? {
+            name: event.name,
+            allocationAmount: event.allocationAmount,
+            date: isTbd(event) ? "" : event.date!,
+            tbd: isTbd(event),
+            contributionDeadline: event.contributionDeadline ?? "",
+            schedules: event.schedules ?? [],
+          }
+        : EMPTY_FORM,
+    );
   };
 
-  const updateSchedule = (
-    period: EventSession,
-    updates: Partial<EventSchedule>,
-  ) => {
-    setEventForm((prev) => ({
-      ...prev,
-      schedules: prev.schedules.map((schedule) =>
-        schedule.period === period
-          ? {
-              ...schedule,
-              ...updates,
-            }
-          : schedule,
-      ),
-    }));
+  const addSession = () => {
+    if (!sessionToAdd) return;
+    if (form.schedules.some((s) => s.period === sessionToAdd)) return void toast.error("This schedule has already been added");
+    patchForm({ schedules: [...form.schedules, { period: sessionToAdd, timeInEnabled: true, timeOutEnabled: true, timeIn: "", timeOut: "" }] });
+    setSessionToAdd("");
   };
 
-  const openAddEventModal = () => {
-    setEditingEvent(null);
-
-    setEventForm({
-      name: "",
-      allocationAmount: 0,
-      date: "",
-      contributionDeadline: "",
-      schedules: [],
-    });
-
-    setEventDateTbd(false);
-    setShowEventModal(true);
-  };
-
-  const handleOpenEditEvent = (event: Event) => {
-    setEditingEvent(event);
-
-    setEventForm({
-      name: event.name,
-      allocationAmount: event.allocationAmount,
-      date: event.date && event.date !== "TBD" ? event.date : "",
-      contributionDeadline: event.contributionDeadline ?? "",
-      schedules: event.schedules ?? [],
-    });
-
-    setEventDateTbd(!event.date || event.date === "TBD");
-    setShowEventModal(true);
-  };
-
-  const handleAddEvent = async () => {
+  const saveEvent = async () => {
+    if (!editing) return;
+    const { tbd, ...rest } = form;
+    const payload = { ...rest, date: tbd ? "TBD" : form.date };
+    setSaving(true);
     try {
-      setSaving(true);
-
-      const newEvent = await eventsService.create({
-        name: eventForm.name,
-        allocationAmount: eventForm.allocationAmount,
-        date: eventDateTbd ? "TBD" : eventForm.date,
-        contributionDeadline: eventForm.contributionDeadline,
-        schedules: eventForm.schedules,
-      });
-
-      setEvents([...events, newEvent]);
-      setShowEventModal(false);
-
-      setEventForm({
-        name: "",
-        allocationAmount: 0,
-        date: "",
-        contributionDeadline: "",
-        schedules: [],
-      });
-
-      setEventDateTbd(false);
-
-      toast.success("Event created successfully");
+      if (editing === "new") {
+        const created = await eventsService.create(payload);
+        setEvents((prev) => [...prev, created]);
+      } else {
+        const updated = await eventsService.update(editing.id, payload);
+        replaceEvent(editing.id, updated);
+      }
+      toast.success(`Event ${editing === "new" ? "created" : "updated"} successfully`);
+      setEditing(null);
     } catch (error) {
-      console.error("Error creating event:", error);
-      toast.error("Failed to create event");
+      console.error("Error saving event:", error);
+      toast.error(`Failed to ${editing === "new" ? "create" : "update"} event`);
     } finally {
       setSaving(false);
     }
   };
 
-  const handleUpdateEvent = async () => {
-    if (!editingEvent) return;
-
+  const deleteEvent = async () => {
+    if (!toDelete) return;
+    setSaving(true);
     try {
-      setSaving(true);
-
-      const updated = await eventsService.update(editingEvent.id, {
-        name: eventForm.name,
-        allocationAmount: eventForm.allocationAmount,
-        date: eventDateTbd ? "TBD" : eventForm.date,
-        contributionDeadline: eventForm.contributionDeadline,
-        schedules: eventForm.schedules,
-      });
-
-      setEvents(events.map((e) => (e.id === editingEvent.id ? updated : e)));
-
-      setEditingEvent(null);
-      setShowEventModal(false);
-
-      setEventForm({
-        name: "",
-        allocationAmount: 0,
-        date: "",
-        contributionDeadline: "",
-        schedules: [],
-      });
-
-      setEventDateTbd(false);
-
-      toast.success("Event updated successfully");
-    } catch (error) {
-      console.error("Error updating event:", error);
-      toast.error("Failed to update event");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleOpenDeleteConfirm = (event: Event) => {
-    setOpenActionMenu(null);
-    setEventToDelete(event);
-    setShowDeleteConfirm(true);
-  };
-
-  const handleOpenEvaluationRollout = (event: Event) => {
-    setOpenActionMenu(null);
-    setEvaluationTarget(event);
-    setEvaluationFormUrlInput(event.evaluationFormUrl ?? "");
-  };
-
-  const handleConfirmEvaluationRollout = async () => {
-    if (!evaluationTarget) return;
-    if (!evaluationFormUrlInput.trim()) {
-      toast.error("Paste this event's evaluation Form URL first.");
-      return;
-    }
-
-    try {
-      setSavingEvaluation(true);
-
-      await eventsService.update(evaluationTarget.id, {
-        evaluationActive: true,
-        evaluationFormUrl: evaluationFormUrlInput.trim(),
-      });
-
-      await notificationsService.sendAnnouncement({
-        recipientKind: "all_students",
-        title: `Evaluation open: ${evaluationTarget.name}`,
-        body: "Please complete the evaluation for this event — it's required before you can access your record again.",
-      });
-
-      setEvents(
-        events.map((e) =>
-          e.id === evaluationTarget.id
-            ? {
-                ...e,
-                evaluationActive: true,
-                evaluationFormUrl: evaluationFormUrlInput.trim(),
-              }
-            : e,
-        ),
-      );
-
-      setEvaluationTarget(null);
-      toast.success("Evaluation rolled out and students notified");
-    } catch (error) {
-      console.error("Error rolling out evaluation:", error);
-      toast.error("Failed to roll out evaluation");
-    } finally {
-      setSavingEvaluation(false);
-    }
-  };
-
-  const handleStopEvaluationRollout = async (event: Event) => {
-    setOpenActionMenu(null);
-
-    try {
-      await eventsService.update(event.id, { evaluationActive: false });
-      setEvents(
-        events.map((e) =>
-          e.id === event.id ? { ...e, evaluationActive: false } : e,
-        ),
-      );
-      toast.success("Evaluation requirement turned off");
-    } catch (error) {
-      console.error("Error stopping evaluation rollout:", error);
-      toast.error("Failed to update event");
-    }
-  };
-
-  const handleDeleteEvent = async () => {
-    if (!eventToDelete) return;
-
-    try {
-      setSaving(true);
-
-      await eventsService.delete(eventToDelete.id);
-
-      setEvents(events.filter((e) => e.id !== eventToDelete.id));
-
-      setEventToDelete(null);
-      setShowDeleteConfirm(false);
-
+      await eventsService.delete(toDelete.id);
+      setEvents((prev) => prev.filter((e) => e.id !== toDelete.id));
+      setToDelete(null);
       toast.success("Event deleted successfully");
     } catch (error) {
       console.error("Error deleting event:", error);
@@ -409,731 +167,341 @@ export default function EventManagementSection({
     }
   };
 
-  // Expected collection:
-  // Allocation per student × total number of students
-  const expectedCollection = (event: Event) => {
-    const allocation = Number(event.allocationAmount) || 0;
-    const studentCount = students.length;
-
-    return allocation * studentCount;
-  };
-
-  // Actual collection:
-  // Sum of amountPaid for all contributions belonging to this event,
-  // computed in Postgres via get_event_contribution_totals() rather than
-  // downloading every contribution row to sum client-side.
-  const collectedAmount = (event: Event) => {
-    return eventTotals[event.id] ?? 0;
-  };
-
-  /** Schedule label for the events list. */
-  const scheduleLabel = (event: Event): React.ReactNode => {
-    if (!event.schedules || event.schedules.length === 0) {
-      return "-";
+  const rollOutEvaluation = async () => {
+    if (!evaluating) return;
+    const url = formUrl.trim();
+    if (!url) return void toast.error("Paste this event's evaluation Form URL first.");
+    setSaving(true);
+    try {
+      await eventsService.update(evaluating.id, { evaluationActive: true, evaluationFormUrl: url });
+      await notificationsService.sendAnnouncement({
+        recipientKind: "all_students",
+        title: `Evaluation open: ${evaluating.name}`,
+        body: "Please complete the evaluation for this event — it's required before you can access your record again.",
+      });
+      replaceEvent(evaluating.id, { evaluationActive: true, evaluationFormUrl: url });
+      setEvaluating(null);
+      toast.success("Evaluation rolled out and students notified");
+    } catch (error) {
+      console.error("Error rolling out evaluation:", error);
+      toast.error("Failed to roll out evaluation");
+    } finally {
+      setSaving(false);
     }
-
-    return (
-      <div className="flex flex-col gap-1">
-        {event.schedules.map((schedule) => {
-          const label =
-            schedule.period === "morning"
-              ? "☀ Morning"
-              : schedule.period === "afternoon"
-                ? "🌤 Afternoon"
-                : "🌙 Evening";
-
-          const time =
-            schedule.timeIn || schedule.timeOut
-              ? formatTimeRange(schedule.timeIn, schedule.timeOut)
-              : "Time not set";
-
-          return (
-            <span key={schedule.period} className="whitespace-nowrap">
-              {label}: {time}
-            </span>
-          );
-        })}
-      </div>
-    );
   };
 
-  // Upcoming events listed soonest first.
-  const todaysISO = today();
+  const stopEvaluation = async (event: Event) => {
+    try {
+      await eventsService.update(event.id, { evaluationActive: false });
+      replaceEvent(event.id, { evaluationActive: false });
+      toast.success("Evaluation requirement turned off");
+    } catch (error) {
+      console.error("Error stopping evaluation rollout:", error);
+      toast.error("Failed to update event");
+    }
+  };
 
-  const sortedEvents = useMemo(() => {
-    return [...events].sort((a, b) => {
-      const aTbd = !a.date || a.date === "TBD";
-      const bTbd = !b.date || b.date === "TBD";
-
-      if (aTbd && !bTbd) return 1;
-      if (!aTbd && bTbd) return -1;
-
-      if (aTbd && bTbd) {
-        return a.name.localeCompare(b.name);
-      }
-
-      return (a.date ?? "").localeCompare(b.date ?? "");
-    });
-  }, [events]);
+  const upcoming = events.filter((e) => !isTbd(e) && daysUntil(e.date!) >= 0).length;
+  const totalCollected = Object.values(collected).reduce((sum, n) => sum + n, 0);
 
   return (
-    <section
-      ref={sectionRef}
-      className="min-h-screen w-full gradient-bg-orange relative overflow-hidden py-20 lg:py-24"
+    <Page
+      eyebrow="Events"
+      title="Event Management"
+      subtitle="Plan events, attendance sessions and per-student allocations."
+      onBack={onBack}
+      actions={
+        canManage && (
+          <button onClick={() => openForm()} className="btn btn-primary">
+            <Plus className="h-4 w-4" /> Create event
+          </button>
+        )
+      }
+      hero={
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <StatCard featured label="Total events" value={events.length} icon={Calendar} />
+          <StatCard label="Upcoming" value={upcoming} icon={CalendarClock} tone="warning" />
+          <StatCard label="Students" value={studentCount} icon={Users} />
+          <StatCard label="Collected" value={formatPeso(totalCollected)} icon={Wallet} tone="success" />
+        </div>
+      }
     >
-      {/* Content */}
-      <div
-        ref={contentRef}
-        className="relative z-10 w-full px-4 sm:px-6 lg:px-8 xl:px-12"
+      {loading ? (
+        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }, (_, i) => (
+            <Skeleton key={i} className="h-72 rounded-3xl" />
+          ))}
+        </div>
+      ) : sortedEvents.length === 0 ? (
+        <div className="card">
+          <EmptyState
+            icon={Calendar}
+            title="No events yet"
+            description="Create an event to start tracking attendance and contributions."
+            action={canManage && <button onClick={() => openForm()} className="btn btn-primary btn-sm"><Plus className="h-4 w-4" /> Create event</button>}
+          />
+        </div>
+      ) : (
+        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+          {sortedEvents.map((event) => (
+            <EventCard
+              key={event.id}
+              event={event}
+              expected={(Number(event.allocationAmount) || 0) * studentCount}
+              collected={collected[event.id] ?? 0}
+              actions={
+                canManage && (
+                  <Menu>
+                    <RowActionsTrigger label={`Actions for ${event.name}`} />
+                    <MenuContent>
+                      <MenuItem onSelect={() => openForm(event)}><Pencil /> Edit</MenuItem>
+                      {event.evaluationActive ? (
+                        <MenuItem onSelect={() => stopEvaluation(event)}><ClipboardCheck /> Turn off evaluation</MenuItem>
+                      ) : (
+                        <MenuItem onSelect={() => { setEvaluating(event); setFormUrl(event.evaluationFormUrl ?? ""); }}>
+                          <ClipboardCheck /> Roll out evaluation
+                        </MenuItem>
+                      )}
+                      <MenuSeparator />
+                      <MenuItem danger onSelect={() => setToDelete(event)}><Trash2 /> Delete</MenuItem>
+                    </MenuContent>
+                  </Menu>
+                )
+              }
+            />
+          ))}
+        </div>
+      )}
+
+      <Modal
+        open={!!editing}
+        onClose={() => setEditing(null)}
+        size="lg"
+        icon={<Calendar className="h-5 w-5 text-brand-500" />}
+        title={editing === "new" ? "Create event" : "Edit event"}
+        description="Sessions define which attendance scans this event expects."
+        footer={
+          <>
+            <button className="btn btn-secondary" onClick={() => setEditing(null)} disabled={saving}>Cancel</button>
+            <button className="btn btn-primary" onClick={saveEvent} disabled={saving || !form.name.trim() || (!form.tbd && !form.date)}>
+              {saving ? "Saving…" : editing === "new" ? "Create event" : "Save changes"}
+            </button>
+          </>
+        }
       >
-        {/* Header */}
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-6">
-          <div className="flex items-center gap-4">
-            <SectionBackButton onClick={onBack} />
+        <div className="space-y-4">
+          <Field label="Event name">
+            <input className="input" value={form.name} onChange={(e) => patchForm({ name: e.target.value })} placeholder="e.g., General Assembly" />
+          </Field>
 
+          <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <h1 className="font-display font-bold text-2xl lg:text-3xl text-dark">
-                Event Management
-              </h1>
-
-              <p className="text-text-secondary text-sm">
-                Manage events and allocations
-              </p>
+              <div className="flex items-center justify-between">
+                <span className="label">Date</span>
+                <label className="mb-1.5 flex cursor-pointer items-center gap-1.5 text-xs font-medium text-muted">
+                  <input type="checkbox" className="accent-brand-500" checked={form.tbd} onChange={(e) => patchForm({ tbd: e.target.checked, date: "" })} />
+                  To be determined
+                </label>
+              </div>
+              <input type="date" className="input" value={form.date} disabled={form.tbd} onChange={(e) => patchForm({ date: e.target.value })} />
             </div>
+            <Field label="Contribution deadline" hint="Last on-time day. Blank = no deadline.">
+              <input type="date" className="input" value={form.contributionDeadline} onChange={(e) => patchForm({ contributionDeadline: e.target.value })} />
+            </Field>
           </div>
 
-          {canManageEvents && (
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={openAddEventModal}
-                className="btn-primary px-4 py-2.5 flex items-center gap-2 text-sm"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Create Event</span>
+          <Field label="Allocation per student (₱)">
+            <input
+              type="number"
+              min={0}
+              className="input"
+              placeholder="0"
+              value={form.allocationAmount || ""}
+              onChange={(e) => patchForm({ allocationAmount: parseInt(e.target.value) || 0 })}
+            />
+          </Field>
+
+          <div className="space-y-3 rounded-2xl border border-line bg-surface-2 p-4">
+            <div>
+              <p className="text-sm font-semibold text-ink">Attendance schedule</p>
+              <p className="text-xs text-muted">Add only the sessions required for this event.</p>
+            </div>
+            <div className="flex gap-2">
+              <select className="input flex-1" value={sessionToAdd} onChange={(e) => setSessionToAdd(e.target.value as EventSession | "")}>
+                <option value="">Select time of day</option>
+                {Object.entries(SESSIONS).map(([key, { label }]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+              <button type="button" className="btn btn-secondary h-11" onClick={addSession} disabled={!sessionToAdd}>
+                <Plus className="h-4 w-4" /> Add
               </button>
             </div>
-          )}
-        </div>
 
-        {/* Loading State */}
-        {loading && <SectionLoader message="Loading data..." />}
-
-        {/* Events Table */}
-        {!loading && (
-          <div className="glass-card p-5 lg:p-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-red/10 flex items-center justify-center">
-                  <Calendar className="w-5 h-5 text-red" />
-                </div>
-
-                <h3 className="font-display font-semibold text-lg text-dark">
-                  Upcoming Events & Allocations
-                </h3>
-              </div>
-            </div>
-
-            <div className="rounded-xl overflow-hidden border border-gray-200">
-              <div className="overflow-x-auto">
-                <table className="glass-table">
-                  <thead>
-                    <tr>
-                      <th>Event Name</th>
-                      <th>Date</th>
-                      <th>Deadline</th>
-                      <th>Schedule</th>
-                      <th>Allocation</th>
-                      <th>Expected Collection</th>
-                      <th>Collected</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-
-                  <tbody>
-                    {sortedEvents.map((event) => (
-                      <tr key={event.id}>
-                        {/* Event Name */}
-                        <td className="font-medium text-dark">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            {event.name}
-                          </div>
-                        </td>
-
-                        {/* Date */}
-                        <td className="text-text-secondary whitespace-nowrap">
-                          {event.date && event.date !== "TBD" ? (
-                            <div className="flex items-center gap-2">
-                              <span>{formatDate(event.date)}</span>
-
-                              {event.date >= todaysISO && (
-                                <span
-                                  className={`text-[11px] px-1.5 py-0.5 rounded-full font-medium ${
-                                    daysUntil(event.date) === 0
-                                      ? "bg-red-500 text-white"
-                                      : "bg-green-100 text-green-600"
-                                  }`}
-                                >
-                                  {daysUntil(event.date) === 0
-                                    ? "Today"
-                                    : `In ${daysUntil(event.date)}d`}
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700">
-                              TBD
-                            </span>
-                          )}
-                        </td>
-
-                        {/* Deadline */}
-                        <td className="text-text-secondary whitespace-nowrap">
-                          {event.contributionDeadline ? (
-                            <div className="flex items-center gap-2">
-                              <span>
-                                {formatDate(event.contributionDeadline)}
-                              </span>
-
-                              <span
-                                className={`text-[11px] px-1.5 py-0.5 rounded-full font-medium ${
-                                  daysUntil(event.contributionDeadline) < 0
-                                    ? "bg-red-500 text-white"
-                                    : daysUntil(event.contributionDeadline) ===
-                                        0
-                                      ? "bg-red-500 text-white"
-                                      : "bg-green-100 text-green-600"
-                                }`}
-                              >
-                                {daysUntil(event.contributionDeadline) < 0
-                                  ? "Overdue"
-                                  : daysUntil(event.contributionDeadline) === 0
-                                    ? "Today"
-                                    : `In ${daysUntil(event.contributionDeadline)}d`}
-                              </span>
-                            </div>
-                          ) : (
-                            <span className="text-text-secondary/60">
-                              No deadline
-                            </span>
-                          )}
-                        </td>
-
-                        {/* Schedule */}
-                        <td className="text-text-secondary whitespace-nowrap">
-                          {scheduleLabel(event)}
-                        </td>
-
-                        {/* Allocation */}
-                        <td className="text-text-secondary whitespace-nowrap">
-                          {formatPeso(event.allocationAmount)}
-                        </td>
-
-                        {/* Expected Collection */}
-                        <td className="font-medium text-green-600 whitespace-nowrap">
-                          {formatPeso(expectedCollection(event))}
-                        </td>
-
-                        {/* Actual Collected */}
-                        <td className="font-medium text-blue-600 whitespace-nowrap">
-                          {formatPeso(collectedAmount(event))}
-                        </td>
-
-                        {/* Actions */}
-                        <td>
-                          {canManageEvents && (
-                            <div className="relative flex justify-center">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setOpenActionMenu(
-                                    openActionMenu === event.id
-                                      ? null
-                                      : event.id,
-                                  )
-                                }
-                                className="w-9 h-9 rounded-lg flex items-center justify-center hover:bg-black/5 transition-colors"
-                                title="Event actions"
-                                aria-label={`Actions for ${event.name}`}
-                              >
-                                <MoreVertical className="w-5 h-5 text-text-secondary" />
-                              </button>
-
-                              {openActionMenu === event.id && (
-                                <div className="absolute right-0 top-10 z-30 w-36 rounded-xl border border-gray-200 bg-white shadow-lg overflow-hidden">
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setOpenActionMenu(null);
-                                      handleOpenEditEvent(event);
-                                    }}
-                                    className="w-full px-4 py-2.5 text-left text-sm text-dark hover:bg-gray-50 flex items-center gap-2"
-                                  >
-                                    <Pencil className="w-4 h-4" />
-                                    Edit
-                                  </button>
-
-                                  {event.evaluationActive ? (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleStopEvaluationRollout(event)
-                                      }
-                                      className="w-full px-4 py-2.5 text-left text-sm text-dark hover:bg-gray-50 flex items-center gap-2"
-                                    >
-                                      <UserCheck className="w-4 h-4" />
-                                      Turn off evaluation
-                                    </button>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleOpenEvaluationRollout(event)
-                                      }
-                                      className="w-full px-4 py-2.5 text-left text-sm text-dark hover:bg-gray-50 flex items-center gap-2"
-                                    >
-                                      <UserCheck className="w-4 h-4" />
-                                      Roll out evaluation
-                                    </button>
-                                  )}
-
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleOpenDeleteConfirm(event)
-                                    }
-                                    className="w-full px-4 py-2.5 text-left text-sm text-red hover:bg-red/5 flex items-center gap-2"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                    Delete
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {events.length === 0 && (
-              <SectionEmptyState message="No events found" icon={Calendar} />
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Add/Edit Event Modal */}
-      <Dialog
-        open={showEventModal || !!editingEvent}
-        onOpenChange={(open) => {
-          if (!open) {
-            setShowEventModal(false);
-            setEditingEvent(null);
-            setEventDateTbd(false);
-          }
-        }}
-      >
-        <DialogContent className="glass-card-strong w-[calc(100%-2rem)] max-w-lg max-h-[90vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              {editingEvent ? "Edit Event" : "Create New Event"}
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-4 mt-4">
-            {/* Event Name */}
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Event Name
-              </label>
-
-              <input
-                type="text"
-                value={eventForm.name}
-                onChange={(e) =>
-                  setEventForm({
-                    ...eventForm,
-                    name: e.target.value,
-                  })
-                }
-                className="glass-input w-full px-4 py-2"
-                placeholder="e.g., General Assembly"
-              />
-            </div>
-
-            {/* Date */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-sm font-medium text-dark">
-                  Date
-                </label>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    const nextValue = !eventDateTbd;
-
-                    setEventDateTbd(nextValue);
-
-                    if (nextValue) {
-                      setEventForm({
-                        ...eventForm,
-                        date: "",
-                      });
-                    }
-                  }}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    eventDateTbd ? "bg-red" : "bg-gray-300"
-                  }`}
-                  aria-label="Toggle date TBD"
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      eventDateTbd ? "translate-x-6" : "translate-x-1"
-                    }`}
-                  />
-                </button>
-              </div>
-
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs text-text-secondary">
-                  Mark date as To Be Determined
-                </span>
-
-                {eventDateTbd && (
-                  <span className="text-xs font-semibold text-red">TBD</span>
-                )}
-              </div>
-
-              <input
-                type="date"
-                value={eventForm.date}
-                onChange={(e) =>
-                  setEventForm({
-                    ...eventForm,
-                    date: e.target.value,
-                  })
-                }
-                disabled={eventDateTbd}
-                className={`glass-input w-full px-4 py-2 ${
-                  eventDateTbd ? "opacity-50 cursor-not-allowed" : ""
-                }`}
-              />
-            </div>
-
-            {/* Contribution deadline */}
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Contribution deadline
-              </label>
-
-              <p className="text-xs text-text-secondary mb-2">
-                Last day a student's contribution counts as on-time. Leave blank
-                for no deadline.
-              </p>
-
-              <input
-                type="date"
-                value={eventForm.contributionDeadline}
-                onChange={(e) =>
-                  setEventForm({
-                    ...eventForm,
-                    contributionDeadline: e.target.value,
-                  })
-                }
-                className="glass-input w-full px-4 py-2"
-              />
-            </div>
-
-            {/* Attendance Schedule */}
-            <div className="rounded-xl border border-white/50 bg-white/30 p-4 space-y-4">
-              <div>
-                <p className="text-sm font-semibold text-dark">
-                  Attendance Schedule
-                </p>
-
-                <p className="text-xs text-text-secondary mt-1">
-                  Add only the sessions required for this event.
-                </p>
-              </div>
-
-              <div className="flex gap-2">
-                <select
-                  value={scheduleToAdd}
-                  onChange={(e) =>
-                    setScheduleToAdd(e.target.value as EventSession | "")
-                  }
-                  className="glass-input flex-1 px-3 py-2"
-                >
-                  <option value="">Select time of day</option>
-                  <option value="morning">☀ Morning</option>
-                  <option value="afternoon">🌤 Afternoon</option>
-                  <option value="evening">🌙 Evening</option>
-                </select>
-
-                <button
-                  type="button"
-                  onClick={addSchedule}
-                  disabled={!scheduleToAdd}
-                  className="btn-primary px-4 py-2 flex items-center gap-2"
-                >
-                  <Plus className="w-4 h-4" />
-                  Add
-                </button>
-              </div>
-
-              {eventForm.schedules.map((schedule) => (
-                <div
-                  key={schedule.period}
-                  className="rounded-lg border border-white/50 bg-white/40 p-3 space-y-3"
-                >
+            {form.schedules.map((s) => {
+              const { label, icon: Icon } = SESSIONS[s.period];
+              return (
+                <div key={s.period} className="space-y-3 rounded-xl border border-line bg-surface p-3">
                   <div className="flex items-center justify-between">
-                    <p className="font-semibold text-dark capitalize">
-                      {schedule.period === "morning" && "☀ Morning"}
-                      {schedule.period === "afternoon" && "🌤 Afternoon"}
-                      {schedule.period === "evening" && "🌙 Evening"}
-                    </p>
-
-                    <button
-                      type="button"
-                      onClick={() => removeSchedule(schedule.period)}
-                      className="text-xs text-red hover:underline"
-                    >
+                    <p className="flex items-center gap-2 text-sm font-semibold text-ink"><Icon className="h-4 w-4 text-brand-500" /> {label}</p>
+                    <button type="button" className="btn btn-ghost btn-sm text-danger" onClick={() => patchForm({ schedules: form.schedules.filter((x) => x.period !== s.period) })}>
                       Remove
                     </button>
                   </div>
-
-                  {/* TIME IN */}
-                  <div>
-                    <label className="flex items-center gap-2 text-sm font-medium text-dark mb-2">
-                      <input
-                        type="checkbox"
-                        checked={schedule.timeInEnabled}
-                        onChange={(e) =>
-                          updateSchedule(schedule.period, {
-                            timeInEnabled: e.target.checked,
-                            timeIn: e.target.checked ? schedule.timeIn : "",
-                          })
-                        }
-                      />
-                      Enable Time In
-                    </label>
-
-                    {schedule.timeInEnabled && (
-                      <TimeInput12
-                        value={schedule.timeIn ?? ""}
-                        onChange={(value) =>
-                          updateSchedule(schedule.period, {
-                            timeIn: value,
-                          })
-                        }
-                        ariaLabel={`${schedule.period} time in`}
-                      />
-                    )}
-                  </div>
-
-                  {/* TIME OUT */}
-                  <div>
-                    <label className="flex items-center gap-2 text-sm font-medium text-dark mb-2">
-                      <input
-                        type="checkbox"
-                        checked={schedule.timeOutEnabled}
-                        onChange={(e) =>
-                          updateSchedule(schedule.period, {
-                            timeOutEnabled: e.target.checked,
-                            timeOut: e.target.checked ? schedule.timeOut : "",
-                          })
-                        }
-                      />
-                      Enable Time Out
-                    </label>
-
-                    {schedule.timeOutEnabled && (
-                      <TimeInput12
-                        value={schedule.timeOut ?? ""}
-                        onChange={(value) =>
-                          updateSchedule(schedule.period, {
-                            timeOut: value,
-                          })
-                        }
-                        ariaLabel={`${schedule.period} time out`}
-                      />
-                    )}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {(["In", "Out"] as const).map((dir) => {
+                      const enabledKey = `time${dir}Enabled` as const;
+                      const timeKey = `time${dir}` as const;
+                      return (
+                        <div key={dir}>
+                          <label className="mb-2 flex items-center gap-2 text-xs font-semibold text-muted">
+                            <input
+                              type="checkbox"
+                              className="accent-brand-500"
+                              checked={s[enabledKey]}
+                              onChange={(e) => updateSchedule(s.period, { [enabledKey]: e.target.checked, [timeKey]: e.target.checked ? s[timeKey] : "" })}
+                            />
+                            Time {dir.toLowerCase()}
+                          </label>
+                          {s[enabledKey] && (
+                            <TimeInput12 value={s[timeKey] ?? ""} onChange={(v) => updateSchedule(s.period, { [timeKey]: v })} ariaLabel={`${s.period} time ${dir.toLowerCase()}`} />
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
-              ))}
+              );
+            })}
 
-              {eventForm.schedules.length === 0 && (
-                <div className="text-center py-4 text-sm text-text-secondary">
-                  No attendance schedules added. This event will not require
-                  scheduled attendance.
-                </div>
-              )}
-            </div>
-
-            {/* Allocation Amount */}
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Allocation Amount (₱)
-              </label>
-
-              <input
-                type="number"
-                value={eventForm.allocationAmount || ""}
-                onChange={(e) =>
-                  setEventForm({
-                    ...eventForm,
-                    allocationAmount: parseInt(e.target.value) || 0,
-                  })
-                }
-                className="glass-input w-full px-4 py-2"
-                placeholder="0.00"
-                min="0"
-              />
-            </div>
-
-            {/* Assigned Board Members */}
-            {canManageEvents && boardMembers.length > 0 && (
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1.5">
-                  <span className="flex items-center gap-1.5">
-                    <UserCheck className="w-4 h-4 text-text-secondary" />
-                    Assigned Board Members
-                  </span>
-                </label>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-40 overflow-y-auto rounded-xl border border-white/50 p-3 bg-white/30">
-                  {boardMembers.map((member) => (
-                    <label
-                      key={member.id}
-                      className="flex items-center gap-2 cursor-pointer text-sm hover:text-red transition-colors"
-                    >
-                      <span className="truncate">{member.name}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
+            {form.schedules.length === 0 && (
+              <p className="py-2 text-center text-xs text-muted">No sessions added — this event won't require scheduled attendance.</p>
             )}
-
-            {/* Modal Buttons */}
-            <div className="flex gap-3 pt-4">
-              <button
-                onClick={() => {
-                  setShowEventModal(false);
-                  setEditingEvent(null);
-                  setEventDateTbd(false);
-                }}
-                className="flex-1 glass-button px-4 py-2.5"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-
-              <button
-                onClick={editingEvent ? handleUpdateEvent : handleAddEvent}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2"
-                disabled={
-                  saving ||
-                  !eventForm.name ||
-                  (!eventDateTbd && !eventForm.date)
-                }
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    {editingEvent ? (
-                      <Save className="w-4 h-4" />
-                    ) : (
-                      <Plus className="w-4 h-4" />
-                    )}
-
-                    {editingEvent ? "Update Event" : "Create Event"}
-                  </>
-                )}
-              </button>
-            </div>
           </div>
-        </DialogContent>
-      </Dialog>
+        </div>
+      </Modal>
 
-      {/* Evaluation Rollout Dialog */}
-      <Dialog
-        open={!!evaluationTarget}
-        onOpenChange={(open) => {
-          if (!open) setEvaluationTarget(null);
-        }}
+      <Modal
+        open={!!evaluating}
+        onClose={() => setEvaluating(null)}
+        icon={<ClipboardCheck className="h-5 w-5 text-brand-500" />}
+        title="Roll out evaluation"
+        description={
+          <>
+            Paste the Google Form URL for <b className="text-ink">{evaluating?.name}</b>. Every student not yet in this event's response Sheet must
+            fill it out before viewing their record, and all students will be notified.
+          </>
+        }
+        footer={
+          <>
+            <button className="btn btn-secondary" onClick={() => setEvaluating(null)} disabled={saving}>Cancel</button>
+            <button className="btn btn-primary" onClick={rollOutEvaluation} disabled={saving}>{saving ? "Rolling out…" : "Roll out & notify"}</button>
+          </>
+        }
       >
-        <DialogContent className="glass-card-strong w-[calc(100%-2rem)] max-w-md">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              Roll out evaluation
-            </DialogTitle>
-          </DialogHeader>
+        <Field label="Evaluation form URL">
+          <input type="url" className="input" value={formUrl} onChange={(e) => setFormUrl(e.target.value)} placeholder="https://docs.google.com/forms/d/e/.../viewform" />
+        </Field>
+      </Modal>
 
-          <div className="space-y-4 mt-4">
-            <p className="text-sm text-text-secondary">
-              Paste the Google Form URL for{" "}
-              <span className="font-medium">{evaluationTarget?.name}</span>.
-              Every student not yet recorded in this event's response Sheet will
-              be required to fill it out before they can view their record, and
-              all students will be notified.
-            </p>
+      <ConfirmDialog
+        open={!!toDelete}
+        onClose={() => setToDelete(null)}
+        onConfirm={deleteEvent}
+        loading={saving}
+        title="Delete event"
+        confirmLabel="Delete event"
+        description={
+          <>
+            Delete <b className="text-ink">{toDelete?.name}</b>? This also removes related payments, contributions, attendance records and
+            transactions, and cannot be undone.
+          </>
+        }
+      />
+    </Page>
+  );
+}
 
-            <input
-              type="url"
-              value={evaluationFormUrlInput}
-              onChange={(e) => setEvaluationFormUrlInput(e.target.value)}
-              placeholder="https://docs.google.com/forms/d/e/.../viewform"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
-            />
+function EventCard({ event, expected, collected, actions }: { event: Event; expected: number; collected: number; actions: React.ReactNode }) {
+  const tbd = isTbd(event);
+  const date = tbd ? null : new Date(event.date!);
+  const status = tbd ? { label: "Date TBD", tone: "chip-warning" } : dueChip(event.date!, "Done");
+  const deadline = event.contributionDeadline ? dueChip(event.contributionDeadline, "Overdue") : null;
+  const pct = expected > 0 ? Math.min(100, Math.round((collected / expected) * 100)) : 0;
 
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setEvaluationTarget(null)}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-text-secondary hover:bg-gray-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmEvaluationRollout}
-                disabled={savingEvaluation}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground disabled:opacity-60 flex items-center gap-2"
-              >
-                {savingEvaluation && (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                )}
-                Roll out & notify
-              </button>
+  return (
+    <article className="card card-hover flex flex-col p-5">
+      <div className="flex items-start gap-4">
+        <div className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-brand-500/10 text-center leading-none text-brand-600">
+          {date ? (
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-wider">{date.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })}</p>
+              <p className="mt-0.5 text-xl font-extrabold">{date.getUTCDate()}</p>
+            </div>
+          ) : (
+            <p className="text-xs font-bold">TBD</p>
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate font-bold text-ink" title={event.name}>{event.name}</h3>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <span className={cn("chip", status.tone)}>{status.label}</span>
+            {event.evaluationActive && <span className="chip chip-brand"><ClipboardCheck className="h-3 w-3" /> Evaluation open</span>}
+          </div>
+        </div>
+        {actions}
+      </div>
+
+      <dl className="mt-5 space-y-2.5 text-sm">
+        <div className="flex items-center justify-between gap-3">
+          <dt className="text-muted">Contribution deadline</dt>
+          <dd className="flex items-center gap-1.5 text-right text-ink">
+            {deadline ? (
+              <>
+                {formatDate(event.contributionDeadline!)} <span className={cn("chip", deadline.tone)}>{deadline.label}</span>
+              </>
+            ) : (
+              <span className="text-muted">None</span>
+            )}
+          </dd>
+        </div>
+        <div className="flex items-start justify-between gap-3">
+          <dt className="text-muted">Sessions</dt>
+          <dd className="space-y-1 text-right">
+            {event.schedules?.length ? (
+              event.schedules.map((s) => {
+                const { label, icon: Icon } = SESSIONS[s.period];
+                return (
+                  <p key={s.period} className="flex items-center justify-end gap-1.5 whitespace-nowrap text-ink">
+                    <Icon className="h-3.5 w-3.5 text-brand-500" aria-label={label} />
+                    {s.timeIn || s.timeOut ? formatTimeRange(s.timeIn, s.timeOut) : <span className="text-muted">{label} · time not set</span>}
+                  </p>
+                );
+              })
+            ) : (
+              <span className="flex items-center gap-1.5 text-muted"><Clock className="h-3.5 w-3.5" /> No sessions</span>
+            )}
+          </dd>
+        </div>
+      </dl>
+
+      <div className="mt-auto pt-5">
+        <div className="rounded-2xl bg-surface-2 p-4">
+          <div className="flex items-end justify-between gap-3">
+            <div>
+              <p className="text-xs text-muted">Collected</p>
+              <p className="text-lg font-extrabold text-ink">{formatPeso(collected)}</p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-muted">{formatPeso(event.allocationAmount)} / student</p>
+              <p className="text-xs font-semibold text-muted">of {formatPeso(expected)}</p>
             </div>
           </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Delete Event Confirmation Dialog */}
-      <ConfirmDialog
-        open={showDeleteConfirm}
-        onClose={() => {
-          setShowDeleteConfirm(false);
-          setEventToDelete(null);
-        }}
-        onConfirm={handleDeleteEvent}
-        title="Delete Event"
-        description={`Are you sure you want to delete ${
-          eventToDelete?.name ?? "this event"
-        }? This action cannot be undone.`}
-        warningText="Deleting this event will also remove related payments, contributions, attendance records, and transactions."
-        confirmLabel="Delete Event"
-        loading={saving}
-      />
-    </section>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-line" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+            <div className="h-full rounded-full bg-gradient-to-r from-brand-500 to-indigo-500" style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      </div>
+    </article>
   );
 }

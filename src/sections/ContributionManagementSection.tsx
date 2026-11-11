@@ -1,357 +1,211 @@
-﻿import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+﻿import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
-  Search,
-  Edit2,
-  Trash2,
-  User,
-  Calendar,
-  Save,
+  ArrowRight,
+  CalendarDays,
   Coins,
-  FileText,
   CreditCard,
-  DollarSign,
+  FileUp,
+  ListChecks,
+  Pencil,
+  Receipt,
+  Scale,
+  Trash2,
+  Wallet,
 } from "lucide-react";
-import SectionLoader from "@/components/SectionLoader";
-import Skeleton from "@/components/Skeleton";
-import SectionEmptyState from "@/components/SectionEmptyState";
-import SectionLayout from "@/components/common/SectionLayout";
-import ConfirmDialog from "@/components/common/ConfirmDialog";
-import SummaryCard from "@/components/common/SummaryCard";
-import Pagination from "@/components/common/Pagination";
-import {
-  contributionsService,
-  studentsService,
-  eventsService,
-  paymentsService,
-  subscribeToTables,
-} from "@/services/db";
-import type {
-  ContributionRecord,
-  PaymentRecord,
-  Student,
-  Event,
-  UserRole,
-} from "@/types";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { toast } from "sonner";
+import Page from "@/components/ui/Page";
+import Modal from "@/components/ui/Modal";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import StatCard from "@/components/ui/StatCard";
+import EmptyState from "@/components/ui/EmptyState";
+import Field from "@/components/ui/Field";
+import SearchInput from "@/components/ui/SearchInput";
+import Pagination from "@/components/ui/Pagination";
+import { LoadingCard } from "@/components/ui/Skeleton";
+import { Menu, MenuContent, MenuItem, MenuSeparator, RowActionsTrigger } from "@/components/ui/Menu";
+import ReceiptViewer from "@/components/ReceiptViewer";
+import { contributionsService, studentsService, eventsService, paymentsService, subscribeToTables } from "@/services/db";
+import type { ContributionRecord, PaymentRecord, Student, Event, UserRole } from "@/types";
+import { cn } from "@/lib/utils";
 import { formatDate, formatPeso, today } from "@/lib/format";
 import { contributionStatus } from "@/lib/contributions";
 import { autoCreateReceipt, officialReceiptNumber } from "@/lib/receipts";
-import {
-  pickField,
-  parseAmount,
-  normalizeStudentId,
-  expandEventGroups,
-} from "@/lib/spreadsheet";
+import { pickField, parseAmount, normalizeStudentId, expandEventGroups } from "@/lib/spreadsheet";
 import { useSpreadsheetImport } from "@/hooks/useSpreadsheetImport";
+
 interface ContributionManagementSectionProps {
   onBack: () => void;
   role: UserRole;
   staffName: string;
 }
 
-/** A contribution record enriched with the student's display info. */
 interface ContributionRow extends ContributionRecord {
   studentName: string;
   studentDisplayId: string;
 }
 
-/** Form state for the Edit modal. */
-interface ContributionForm {
+interface EditForm {
+  id: string;
   studentId: string;
   eventId: string;
   requiredAmount: number;
   amountPaid: number;
 }
 
-/** One parsed & matched (student, event) import row waiting to be created. */
-interface ParsedContributionRow {
-  student: Student;
-  event: Event;
-  requiredAmount: number;
-  amountPaid: number;
+const PAGE_SIZE = 20;
+const IMPORT_CONCURRENCY = 5;
+const RECEIPT_ROLES: UserRole[] = ["admin", "treasurer", "auditor"];
+// Values understood by contributionsService.getPage().
+const STATUS_OPTIONS = [
+  ["unpaid", "Unpaid"],
+  ["partial", "Partial Payment"],
+  ["paid", "Fully Paid"],
+] as const;
+const IMPORT_HINT =
+  "Expected columns: Student ID / Name, then Event, Required Amount, Amount Paid (repeat that trio for each additional event).";
+
+const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
+const pairKey = (studentId: string, eventId: string) => `${studentId.toLowerCase()}|${eventId.toLowerCase()}`;
+const isDuplicateError = (error: unknown) =>
+  error instanceof Error && error.message.includes("already has a contribution record for this event");
+
+function StatusChip({ record }: { record: Pick<ContributionRecord, "amountPaid" | "remainingBalance"> }) {
+  const status = contributionStatus(record);
+  return <span className={cn("chip", status.className)}>{status.label}</span>;
 }
 
-const EMPTY_FORM: ContributionForm = {
-  studentId: "",
-  eventId: "",
-  requiredAmount: 0,
-  amountPaid: 0,
-};
-
-/** How many contribution rows are shown per table page. */
-const PAGE_SIZE = 20;
-
-export default function ContributionManagementSection({
-  onBack,
-  role,
-  staffName,
-}: ContributionManagementSectionProps) {
-  const [records, setRecords] = useState<ContributionRow[]>([]);
-  // Unenriched contribution rows (real student/event FKs intact), used to
-  // look up a student+event's contribution while recording a payment —
-  // `records` above overwrites `studentId` with the display ID, so it can't
-  // be used for that lookup.
-  const [contributions, setContributions] = useState<ContributionRecord[]>([]);
-  const [payments, setPayments] = useState<PaymentRecord[]>([]);
+export default function ContributionManagementSection({ onBack, role, staffName }: ContributionManagementSectionProps) {
+  const [rows, setRows] = useState<ContributionRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [totals, setTotals] = useState({ totalRequired: 0, totalPaid: 0, totalBalance: 0 });
   const [students, setStudents] = useState<Student[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  const [eventFilter, setEventFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+
+  const [editForm, setEditForm] = useState<EditForm | null>(null);
+  const [paymentOpen, setPaymentOpen] = useState(false);
+  const [toDelete, setToDelete] = useState<ContributionRow | null>(null);
   const [saving, setSaving] = useState(false);
-  const [showModal, setShowModal] = useState(false);
-  const [editingRecord, setEditingRecord] = useState<ContributionRecord | null>(
-    null,
-  );
-  const [form, setForm] = useState<ContributionForm>(EMPTY_FORM);
+  const [receiptUrl, setReceiptUrl] = useState<string | null>(null);
 
-  // Filters
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
-  const [filters, setFilters] = useState({
-    eventId: "",
-    status: "",
-  });
-  // Debounce database searches so we don't query Supabase on every
-  // individual keystroke.
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setDebouncedSearchTerm(searchTerm.trim());
-    }, 400);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [searchTerm]);
-
-  const [contributionToDelete, setContributionToDelete] =
-    useState<ContributionRow | null>(null);
-
-  // Table pagination — 20 rows per page.
-  const [currentPage, setCurrentPage] = useState(1);
-  const [totalContributions, setTotalContributions] = useState(0);
-  const [contributionTotals, setContributionTotals] = useState({
-    totalRequired: 0,
-    totalPaid: 0,
-    totalBalance: 0,
-  });
-  // Record Payment modal (merged in from the former Payments screen).
-  const [showPaymentModal, setShowPaymentModal] = useState(false);
-  const [paymentForm, setPaymentForm] = useState({
-    studentId: "",
-    eventId: "",
-    amount: 0,
-  });
-  const [paymentStudentSearch, setPaymentStudentSearch] = useState("");
-  const [paymentStudentOpen, setPaymentStudentOpen] = useState(false);
-  const paymentSearchRef = useRef<HTMLDivElement>(null);
-
-  // While a bulk CSV/Excel import is running, each created row would
-  // otherwise fire its own realtime "contributions changed" event and
-  // reload (and re-render) the whole table — see the subscribeToTables
-  // effect below and importContributionRows further down. This flag lets
-  // the realtime callback skip those reloads until the import is done, at
-  // which point importContributionRows reloads the table exactly once.
-  const isImportingRef = useRef(false);
+  const recordedBy = staffName || "Council Officer";
+  const canIssueReceipts = RECEIPT_ROLES.includes(role);
+  // Skips realtime reloads while a bulk import runs; the import reloads once at the end.
+  const importingRef = useRef(false);
+  // Ignores responses from superseded loads (fast paging/typing).
+  const requestRef = useRef(0);
 
   const loadData = useCallback(async () => {
+    const requestId = ++requestRef.current;
     try {
-      setLoading(true);
-
-      const [
-        contributionsPage,
-        contributionTotalsData,
-        allStudents,
-        allEvents,
-        paymentsData,
-      ] = await Promise.all([
-        contributionsService.getPage(
-          currentPage - 1,
-          PAGE_SIZE,
-          debouncedSearchTerm,
-          filters.eventId,
-          filters.status,
-        ),
+      const [pageData, totalsData, allStudents, allEvents, allPayments] = await Promise.all([
+        contributionsService.getPage(page - 1, PAGE_SIZE, query, eventFilter, statusFilter),
         contributionsService.getTotals(),
         studentsService.getAll(),
         eventsService.getAll(),
         paymentsService.getAll(),
       ]);
+      if (requestId !== requestRef.current) return;
+
+      // Deletes/realtime updates can shrink the result set past the current page.
+      const lastPage = Math.max(1, Math.ceil(pageData.total / PAGE_SIZE));
+      if (page > lastPage) return setPage(lastPage);
 
       const studentById = new Map(allStudents.map((s) => [s.id, s]));
-
-      const rows: ContributionRow[] = contributionsPage.data.map((record) => {
-        const student = studentById.get(record.studentId);
-
-        return {
+      setRows(
+        pageData.data.map((record) => ({
           ...record,
-          studentName: student?.name ?? "Unknown Student",
-          studentDisplayId: student?.studentId ?? "—",
-        };
-      });
-
-      setRecords(rows);
-      setContributions(contributionsPage.data);
-      setTotalContributions(contributionsPage.total);
-      setContributionTotals(contributionTotalsData);
-      setStudents(allStudents);
-      setEvents(allEvents);
-      setPayments(paymentsData);
+          studentName: studentById.get(record.studentId)?.name ?? "Unknown Student",
+          studentDisplayId: studentById.get(record.studentId)?.studentId ?? "—",
+        })),
+      );
+      setTotal(pageData.total);
+      setTotals(totalsData);
+      setStudents([...allStudents].sort(byName));
+      setEvents([...allEvents].sort(byName));
+      setPayments(allPayments);
     } catch (error) {
       console.error("Error loading contribution records:", error);
       toast.error("Failed to load contribution records");
     } finally {
       setLoading(false);
     }
-  }, [currentPage, debouncedSearchTerm, filters.eventId, filters.status]);
+  }, [page, query, eventFilter, statusFilter]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Records are always read from Supabase again after a related change, rather
-  // than retaining a separate client-side copy of contribution data.
-  useEffect(() => {
-    return subscribeToTables(
-      ["contributions", "students", "events", "payments"],
-      () => {
-        if (isImportingRef.current) return; // see isImportingRef above
-        loadData();
-      },
-      "contribution-management",
-    );
-  }, [loadData]);
-
-  const sortedStudents = useMemo(
-    () => [...students].sort((a, b) => a.name.localeCompare(b.name)),
-    [students],
-  );
-  const sortedEvents = useMemo(
-    () => [...events].sort((a, b) => a.name.localeCompare(b.name)),
-    [events],
+  useEffect(
+    () =>
+      subscribeToTables(
+        ["contributions", "students", "events", "payments"],
+        () => !importingRef.current && loadData(),
+        "contribution-management",
+      ),
+    [loadData],
   );
 
-  // Summary stats
-  const { totalRequired, totalPaid } = contributionTotals;
-
-  const computedBalance = Math.max(0, form.requiredAmount - form.amountPaid);
-
-  // Reset back to page 1 whenever the search term or filters change the
-  // result set, so the user isn't stranded on a now-empty page.
+  // Debounce server-side search.
   useEffect(() => {
-    setCurrentPage(1);
-  }, [searchTerm, filters.eventId, filters.status]);
-  const totalPages = Math.max(1, Math.ceil(totalContributions / PAGE_SIZE)); // Clamp back onto a valid page if a delete or realtime update shrinks // the result set out from under the current page.
-  useEffect(() => {
-    setCurrentPage((p) => Math.min(p, totalPages));
-  }, [totalPages]);
-  const paginatedRecords = records;
+    const timer = window.setTimeout(() => {
+      setQuery(search.trim());
+      setPage(1);
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [search]);
 
-  // ---------------------------------------------------------------------------
-  // Record Payment (merged in from the former Payments screen — recording a
-  // payment auto-creates the student's contribution record if one doesn't
-  // exist yet, so a separate "Add Contribution" flow is unnecessary).
-  // ---------------------------------------------------------------------------
+  /** Generates and uploads an official receipt (throws on failure). */
+  const issueReceipt = async (student: Student, event: Event, amount: number, imported = false) =>
+    autoCreateReceipt({
+      tag: "PAYMENT",
+      receiptNumber: await officialReceiptNumber(),
+      issuedTo: student.name,
+      eventName: event.name,
+      description: `Payment for ${event.name}${imported ? " (imported)" : ""}`,
+      amount,
+      type: "income",
+      date: today(),
+      recordedBy,
+    });
 
-  const paymentStudentMatches = useMemo(() => {
-    const query = paymentStudentSearch.trim().toLowerCase();
-    if (!query) return [];
-    return students
-      .filter(
-        (s) =>
-          s.name.toLowerCase().includes(query) ||
-          s.studentId.toLowerCase().includes(query),
-      )
-      .slice(0, 8);
-  }, [paymentStudentSearch, students]);
+  const createPayment = (student: Student, event: Event, contributionId: string, amount: number, receiptUrl?: string) =>
+    paymentsService.create({
+      studentId: student.id,
+      studentName: student.name,
+      eventId: event.id,
+      eventName: event.name,
+      contributionId,
+      amount,
+      date: today(),
+      recordedBy,
+      receiptUrl,
+    });
 
-  const selectedPaymentEvent = events.find(
-    (event) => event.id === paymentForm.eventId,
-  );
-  const selectedPaymentContribution = contributions.find(
-    (contribution) =>
-      contribution.studentId === paymentForm.studentId &&
-      contribution.eventId === paymentForm.eventId,
-  );
-  const requiredPaymentAmount =
-    selectedPaymentContribution?.requiredAmount ??
-    selectedPaymentEvent?.allocationAmount;
-  const selectedPaymentStatus = selectedPaymentContribution
-    ? contributionStatus(selectedPaymentContribution)
-    : requiredPaymentAmount !== undefined
-      ? contributionStatus({
-          amountPaid: 0,
-          remainingBalance: requiredPaymentAmount,
-        })
-      : null;
-
-  // Close the picker when clicking anywhere outside of it.
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (
-        paymentSearchRef.current &&
-        !paymentSearchRef.current.contains(event.target as Node)
-      ) {
-        setPaymentStudentOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  const handlePaymentStudentSelect = (student: Student) => {
-    setPaymentForm((prev) => ({ ...prev, studentId: student.id }));
-    setPaymentStudentSearch(`${student.name} (${student.studentId})`);
-    setPaymentStudentOpen(false);
-  };
-
-  const openPaymentModal = () => {
-    setPaymentForm({ studentId: "", eventId: "", amount: 0 });
-    setPaymentStudentSearch("");
-    setPaymentStudentOpen(false);
-    setShowPaymentModal(true);
-  };
-  const validatePaymentAmount = (
-    amount: number,
-    requiredAmount: number,
-    currentPaid = 0,
-  ): string | null => {
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return "Payment amount must be greater than zero.";
-    }
-
-    const remainingBalance = requiredAmount - currentPaid;
-
-    if (amount > remainingBalance) {
-      return `Payment exceeds the remaining balance of ₱${remainingBalance.toFixed(2)}.`;
-    }
-
-    return null;
-  };
-  const handleRecordPayment = async (e: React.FormEvent) => {
-    e.preventDefault();
+  // ---- Record payment (creates the contribution on first payment) ----------
+  const recordPayment = async (student: Student, event: Event, amount: number): Promise<boolean> => {
     try {
       setSaving(true);
-      const student = students.find((s) => s.id === paymentForm.studentId);
-      const event = events.find((e) => e.id === paymentForm.eventId);
-
-      if (!student || !event) {
-        toast.error("Please select both student and event");
-        return;
+      const existing = await contributionsService.getByStudentAndEvent(student.id, event.id);
+      // Validate before creating anything so a rejected payment leaves no stray record.
+      const balance = (existing?.requiredAmount ?? event.allocationAmount) - (existing?.amountPaid ?? 0);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        toast.error("Payment amount must be greater than zero.");
+        return false;
+      }
+      if (amount > balance) {
+        toast.error(`Payment exceeds the remaining balance of ${formatPeso(balance)}.`);
+        return false;
       }
 
-      // Resolve the contribution record first (create it if this student has
-      // no row for the event yet), so the payment can be created already
-      // linked to it via contributionId.
-      let contribution = await contributionsService.getByStudentAndEvent(
-        student.id,
-        event.id,
-      );
+      let contribution = existing;
       if (!contribution) {
         try {
           contribution = await contributionsService.create({
@@ -363,180 +217,68 @@ export default function ContributionManagementSection({
             remainingBalance: event.allocationAmount,
           });
         } catch (createError) {
-          // Someone else (another officer, or an in-flight import) may have
-          // just created this student's contribution for this event -- the
-          // database's unique (student_id, event_id) constraint rejected
-          // ours as a duplicate. Use theirs instead of failing the payment.
-          contribution = await contributionsService.getByStudentAndEvent(
-            student.id,
-            event.id,
-          );
+          // Someone else created it concurrently (unique student+event constraint) — use theirs.
+          contribution = await contributionsService.getByStudentAndEvent(student.id, event.id);
           if (!contribution) throw createError;
         }
       }
-      const validationError = validatePaymentAmount(
-        paymentForm.amount,
-        contribution.requiredAmount,
-        contribution.amountPaid,
-      );
 
-      if (validationError) {
-        toast.error(validationError);
-        return;
-      }
-      // An official receipt is generated automatically (as SVG, uploaded to
-      // the "receipts" Storage bucket) and attached to the payment.
-      let receiptUrl: string | undefined;
-      if (role === "admin" || role === "treasurer" || role === "auditor") {
+      let receipt: string | undefined;
+      if (canIssueReceipts) {
         try {
-          const orNumber = await officialReceiptNumber();
-          receiptUrl = await autoCreateReceipt({
-            tag: "PAYMENT",
-            receiptNumber: orNumber,
-            issuedTo: student.name,
-            eventName: event.name,
-            description: `Payment for ${event.name}`,
-            amount: paymentForm.amount,
-            type: "income",
-            date: today(),
-            recordedBy: staffName || "Council Officer",
-          });
-          toast.success(
-            "An official receipt was generated and attached automatically.",
-          );
+          receipt = await issueReceipt(student, event, amount);
+          toast.success("An official receipt was generated and attached automatically.");
         } catch (receiptError) {
           console.warn("Auto receipt generation failed:", receiptError);
         }
       }
 
-      await paymentsService.create({
-        studentId: paymentForm.studentId,
-        studentName: student.name,
-        eventId: paymentForm.eventId,
-        eventName: event.name,
-        contributionId: contribution.id,
-        amount: paymentForm.amount,
-        date: today(),
-        recordedBy: staffName || "Council Officer",
-        receiptUrl,
-      });
-
+      await createPayment(student, event, contribution.id, amount, receipt);
       await contributionsService.update(contribution.id, {
-        amountPaid: contribution.amountPaid + paymentForm.amount,
-        remainingBalance: Math.max(
-          0,
-          contribution.remainingBalance - paymentForm.amount,
-        ),
+        amountPaid: contribution.amountPaid + amount,
+        remainingBalance: Math.max(0, contribution.remainingBalance - amount),
       });
-
       toast.success("Payment recorded successfully!");
-      setShowPaymentModal(false);
-      setPaymentForm({ studentId: "", eventId: "", amount: 0 });
-      setPaymentStudentSearch("");
-      setPaymentStudentOpen(false);
-
       await loadData();
+      return true;
     } catch (error) {
       console.error("Error recording payment:", error);
       toast.error("Failed to record payment");
+      return false;
     } finally {
       setSaving(false);
     }
   };
 
-  const openEditModal = (record: ContributionRow) => {
-    setEditingRecord(record);
-    setForm({
-      studentId: record.studentId,
-      eventId: record.eventId,
-      requiredAmount: record.requiredAmount,
-      amountPaid: record.amountPaid,
-    });
-    setShowModal(true);
-  };
-
-  const handleSave = async () => {
-    // Basic validation
-    if (!form.studentId || !form.eventId) {
-      toast.error("Please select both a student and an event");
-      return;
-    }
-    if (form.requiredAmount <= 0) {
-      toast.error("Required amount must be greater than zero");
-      return;
-    }
-    if (form.amountPaid < 0) {
-      toast.error("Amount paid cannot be negative");
-      return;
-    }
-
-    const student = students.find((s) => s.id === form.studentId);
-    const event = events.find((e) => e.id === form.eventId);
-    if (!student || !event) {
-      toast.error("Selected student or event no longer exists");
-      return;
-    }
-
-    // One contribution record per student + event combination. `records`
-    // only holds the current table page, so it can't reliably catch a
-    // conflict sitting on a different page -- check the database directly
-    // for this specific pair instead (this is also enforced by a UNIQUE
-    // constraint on the table itself as the last line of defense).
-    try {
-      const existing = await contributionsService.getByStudentAndEvent(
-        form.studentId,
-        form.eventId,
-      );
-      if (existing && existing.id !== editingRecord?.id) {
-        toast.error(
-          `${student.name} already has a contribution record for ${event.name}.`,
-        );
-        return;
-      }
-    } catch (error) {
-      console.error("Error checking for an existing contribution:", error);
-      toast.error("Failed to save contribution record");
-      return;
-    }
+  // ---- Edit -----------------------------------------------------------------
+  const saveEdit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!editForm) return;
+    const { id, studentId, eventId, requiredAmount, amountPaid } = editForm;
+    const student = students.find((s) => s.id === studentId);
+    const event = events.find((ev) => ev.id === eventId);
+    if (!student || !event) return toast.error("Please select both a student and an event");
+    if (requiredAmount <= 0) return toast.error("Required amount must be greater than zero");
+    if (amountPaid < 0) return toast.error("Amount paid cannot be negative");
 
     try {
       setSaving(true);
-      const payload = {
-        studentId: form.studentId,
-        eventId: form.eventId,
-        eventName: event.name,
-        requiredAmount: form.requiredAmount,
-        amountPaid: form.amountPaid,
-        remainingBalance: computedBalance,
-      };
-
-      const enrich = (record: ContributionRecord): ContributionRow => {
-        const studentInfo = students.find((s) => s.id === record.studentId);
-
-        return {
-          ...record,
-          studentName: studentInfo?.name ?? "Unknown Student",
-          studentDisplayId: studentInfo?.studentId ?? "—",
-        };
-      };
-      if (editingRecord) {
-        const updated = await contributionsService.update(
-          editingRecord.id,
-          payload,
-        );
-        setRecords(
-          records.map((r) => (r.id === editingRecord.id ? enrich(updated) : r)),
-        );
-        toast.success("Contribution updated successfully");
-      } else {
-        const created = await contributionsService.create(payload);
-        setRecords([...records, enrich(created)]);
-        toast.success("Contribution added successfully");
+      // One record per student + event; the table only holds one page, so ask the database.
+      const existing = await contributionsService.getByStudentAndEvent(studentId, eventId);
+      if (existing && existing.id !== id) {
+        return toast.error(`${student.name} already has a contribution record for ${event.name}.`);
       }
-
-      setShowModal(false);
-      setEditingRecord(null);
-      setForm(EMPTY_FORM);
+      await contributionsService.update(id, {
+        studentId,
+        eventId,
+        eventName: event.name,
+        requiredAmount,
+        amountPaid,
+        remainingBalance: Math.max(0, requiredAmount - amountPaid),
+      });
+      toast.success("Contribution updated successfully");
+      setEditForm(null);
+      await loadData();
     } catch (error) {
       console.error("Error saving contribution record:", error);
       toast.error("Failed to save contribution record");
@@ -545,400 +287,179 @@ export default function ContributionManagementSection({
     }
   };
 
-  const handleContributionDelete = (record: ContributionRow) => {
-    setContributionToDelete(record);
-    setShowDeleteConfirm(true);
-  };
-
-  const confirmDeleteContribution = async () => {
-    if (!contributionToDelete) return;
-
+  // ---- Delete ---------------------------------------------------------------
+  const confirmDelete = async () => {
+    if (!toDelete) return;
     try {
-      await contributionsService.delete(contributionToDelete.id);
-
-      setRecords((prev) =>
-        prev.filter((record) => record.id !== contributionToDelete.id),
-      );
-
-      toast.success(
-        `${contributionToDelete.studentName}'s contribution record has been deleted.`,
-      );
-
-      setShowDeleteConfirm(false);
-      setContributionToDelete(null);
+      setSaving(true);
+      await contributionsService.delete(toDelete.id);
+      toast.success(`${toDelete.studentName}'s contribution record has been deleted.`);
+      setToDelete(null);
+      await loadData();
     } catch (error) {
       console.error("Error deleting contribution:", error);
-
-      toast.error(
-        `Failed to delete ${contributionToDelete.studentName}'s contribution record.`,
-      );
+      toast.error(`Failed to delete ${toDelete.studentName}'s contribution record.`);
+    } finally {
+      setSaving(false);
     }
   };
-  // ---------------------------------------------------------------------------
-  // CSV / Excel import
-  // ---------------------------------------------------------------------------
 
-  const importContributionRows = async (rows: Record<string, string>[]) => {
-    if (rows.length === 0) {
-      toast.error("File is empty or invalid");
-      return;
-    }
+  // ---- CSV / Excel import ---------------------------------------------------
+  const importRows = async (fileRows: Record<string, string>[]) => {
+    if (fileRows.length === 0) return void toast.error("File is empty or invalid");
 
-    const canIssueReceipts =
-      role === "admin" || role === "treasurer" || role === "auditor";
-
-    let successfulImports = 0;
-    let importFailures = 0;
-    let receiptsIssued = 0;
-    let receiptFailures = 0;
-    // Caught when the database's unique (student_id, event_id) constraint
-    // rejects a row -- e.g. a second import running at the same time, or a
-    // payment recorded for that student+event mid-import. Distinct from
-    // duplicateCount below, which is rows this import already knew were
-    // duplicates before touching the database.
-    let raceDuplicates = 0;
-
-    // Lookup tables (case-insensitive) so rows can reference the student by
-    // ID or by full name, and the event by name.
-    const studentById = new Map(
-      students.map((s) => [normalizeStudentId(s.studentId).toLowerCase(), s]),
-    );
-
-    const studentByName = new Map(
-      students.map((s) => [s.name.toLowerCase(), s]),
-    );
-
+    const studentById = new Map(students.map((s) => [normalizeStudentId(s.studentId).toLowerCase(), s]));
+    const studentByName = new Map(students.map((s) => [s.name.toLowerCase(), s]));
     const eventByName = new Map(events.map((e) => [e.name.toLowerCase(), e]));
+    const parsed: { student: Student; event: Event; requiredAmount: number; amountPaid: number }[] = [];
+    let skipped = 0;
 
-    const parsed: ParsedContributionRow[] = [];
-
-    let unmatchedStudent = 0;
-    let unmatchedEvent = 0;
-    let invalidAmount = 0;
-
-    for (const row of rows) {
-      const fileStudentId = pickField(
-        row,
-        "studentid",
-        "studentno",
-        "studentnumber",
-        "studid",
-        "idnumber",
-        "lrn",
-        "id",
-      );
-
-      const studentName = pickField(row, "name", "fullname", "studentname");
-
+    for (const row of fileRows) {
+      const fileId = pickField(row, "studentid", "studentno", "studentnumber", "studid", "idnumber", "lrn", "id");
       const student =
-        studentById.get(normalizeStudentId(fileStudentId).toLowerCase()) ??
-        studentByName.get(studentName.toLowerCase());
-
-      if (!student) {
-        unmatchedStudent++;
+        studentById.get(normalizeStudentId(fileId).toLowerCase()) ??
+        studentByName.get(pickField(row, "name", "fullname", "studentname").toLowerCase());
+      // A row may hold several Event / Required / Paid groups.
+      const groups = student ? expandEventGroups(row) : [];
+      if (!student || groups.length === 0) {
+        skipped++;
         continue;
       }
-
-      // A row can contain either:
-      //   Event / Required Amount / Amount Paid
-      //
-      // or multiple repeated groups:
-      //   Event / Required Amount / Amount Paid /
-      //   Event / Required Amount / Amount Paid / ...
-      const groups = expandEventGroups(row);
-
-      if (groups.length === 0) {
-        unmatchedEvent++;
-        continue;
-      }
-
       for (const group of groups) {
         const event = eventByName.get(group.eventName.toLowerCase());
-
-        if (!event) {
-          unmatchedEvent++;
-          continue;
-        }
-
         const requiredAmount = parseAmount(group.requiredAmount);
         const amountPaid = parseAmount(group.amountPaid);
-
-        // Required amount must be a valid positive amount.
-        if (requiredAmount <= 0) {
-          invalidAmount++;
+        if (!event || requiredAmount <= 0 || amountPaid < 0 || amountPaid > requiredAmount) {
+          if (event) console.warn(`Skipped invalid amount: ${student.studentId} / ${event.name} (required ₱${requiredAmount}, paid ₱${amountPaid})`);
+          skipped++;
           continue;
         }
-
-        // Paid amount cannot be negative or greater than the required amount.
-        if (amountPaid < 0 || amountPaid > requiredAmount) {
-          invalidAmount++;
-
-          console.warn(
-            `Skipped invalid amount: ${student.studentId} / ${event.name} ` +
-              `(required ₱${requiredAmount}, paid ₱${amountPaid})`,
-          );
-
-          continue;
-        }
-
-        // IMPORTANT:
-        // Do NOT skip a contribution just because the current user cannot
-        // issue receipts.
-        //
-        // The contribution and its historical Amount Paid should still be
-        // imported. Receipt/payment creation is handled separately below
-        // and remains restricted by canIssueReceipts.
-
-        parsed.push({
-          student,
-          event,
-          requiredAmount,
-          amountPaid,
-        });
+        parsed.push({ student, event, requiredAmount, amountPaid });
       }
     }
 
-    if (parsed.length === 0) {
-      toast.error(
-        "No valid rows found. Expected columns: Student ID / Name, then Event, Required Amount, Amount Paid (repeat that trio for each additional event).",
-      );
-      return;
-    }
+    if (parsed.length === 0) return void toast.error(`No valid rows found. ${IMPORT_HINT}`);
 
-    // Skip rows that already have a contribution record, or are duplicated
-    // within the file itself.
-    //
-    // `contributions` only holds the current table page (PAGE_SIZE rows), so
-    // checking against it here would miss existing contributions sitting on
-    // any other page and let real duplicates slip into the import on any
-    // dataset bigger than one page. Fetch the complete set once, just for
-    // this check.
-    let allContributions: ContributionRecord[];
+    // Dedupe against ALL existing records (not just the visible page) and within the file.
+    let existingKeys: Set<string>;
     try {
-      allContributions = await contributionsService.getAll();
+      existingKeys = new Set((await contributionsService.getAll()).map((r) => pairKey(r.studentId, r.eventId)));
     } catch (error) {
       console.error("Error loading existing contributions for import:", error);
-      toast.error("Failed to check for existing contribution records");
-      return;
+      return void toast.error("Failed to check for existing contribution records");
     }
-
-    const existingKeys = new Set(
-      allContributions.map(
-        (r) => `${r.studentId.toLowerCase()}|${r.eventId.toLowerCase()}`,
-      ),
-    );
-
-    const seen = new Set<string>();
-
-    const deduped = parsed.filter((c) => {
-      const key = `${c.student.id.toLowerCase()}|${c.event.id.toLowerCase()}`;
-
-      if (existingKeys.has(key) || seen.has(key)) {
-        return false;
-      }
-
-      seen.add(key);
+    const queue = parsed.filter(({ student, event }) => {
+      const key = pairKey(student.id, event.id);
+      if (existingKeys.has(key)) return false;
+      existingKeys.add(key);
       return true;
     });
+    skipped += parsed.length - queue.length;
+    if (queue.length === 0) return void toast.info("All rows in the file already have contribution records");
 
-    const duplicateCount = parsed.length - deduped.length;
+    importingRef.current = true;
+    toast.info(`Importing ${queue.length} contribution(s)...`);
+    const count = { imported: 0, failed: 0, receipts: 0, receiptFailed: 0 };
 
-    if (deduped.length === 0) {
-      toast.info("All rows in the file already have contribution records");
-      return;
-    }
-
-    // Pause realtime-triggered reloads during the import.
-    isImportingRef.current = true;
-
-    toast.info(`Importing ${deduped.length} contribution(s)...`);
-
-    try {
-      // Bounded concurrency so a large spreadsheet doesn't fire
-      // hundreds of Supabase requests at once.
-      const CONCURRENCY = 5;
-      let cursor = 0;
-      let receiptQueue = Promise.resolve();
-
-      const getNextReceiptNumber = async () => {
-        const previous = receiptQueue;
-
-        let resolveQueue!: () => void;
-
-        receiptQueue = new Promise<void>((resolve) => {
-          resolveQueue = resolve;
-        });
-
-        await previous;
-
+    // Bounded concurrency so a big sheet doesn't fire hundreds of requests at once.
+    const worker = async () => {
+      for (let item = queue.shift(); item; item = queue.shift()) {
+        const { student, event, requiredAmount, amountPaid } = item;
         try {
-          return await officialReceiptNumber();
-        } finally {
-          resolveQueue();
-        }
-      };
-      const worker = async () => {
-        while (cursor < deduped.length) {
-          const item = deduped[cursor++];
-
-          try {
-            const contribution = await contributionsService.create({
-              studentId: item.student.id,
-              eventId: item.event.id,
-              eventName: item.event.name,
-              requiredAmount: item.requiredAmount,
-              amountPaid: item.amountPaid,
-              remainingBalance: Math.max(
-                0,
-                item.requiredAmount - item.amountPaid,
-              ),
-            });
-            successfulImports++;
-            // Only users allowed to issue receipts should generate
-            // official receipts and payment records.
-            //
-            // The contribution itself has already stored Amount Paid,
-            // so users without receipt permission do not lose the
-            // historical payment amount.
-            if (item.amountPaid > 0 && canIssueReceipts) {
-              try {
-                const orNumber = await getNextReceiptNumber();
-
-                const receiptUrl = await autoCreateReceipt({
-                  tag: "PAYMENT",
-                  receiptNumber: orNumber,
-                  issuedTo: item.student.name,
-                  eventName: item.event.name,
-                  description: `Payment for ${item.event.name} (imported)`,
-                  amount: item.amountPaid,
-                  type: "income",
-                  date: today(),
-                  recordedBy: staffName || "Council Officer",
-                });
-
-                await paymentsService.create({
-                  studentId: item.student.id,
-                  studentName: item.student.name,
-                  eventId: item.event.id,
-                  eventName: item.event.name,
-                  contributionId: contribution.id,
-                  amount: item.amountPaid,
-                  date: today(),
-                  recordedBy: staffName || "Council Officer",
-                  receiptUrl,
-                });
-
-                receiptsIssued++;
-              } catch (receiptError) {
-                console.warn(
-                  "Auto receipt generation failed for an imported row:",
-                  receiptError,
-                );
-
-                receiptFailures++;
-              }
-            }
-          } catch (error) {
-            const isDuplicate =
-              error instanceof Error &&
-              error.message.includes(
-                "already has a contribution record for this event",
-              );
-
-            if (isDuplicate) {
-              raceDuplicates++;
-            } else {
-              importFailures++;
-              console.error("Error importing a contribution row:", error);
+          const contribution = await contributionsService.create({
+            studentId: student.id,
+            eventId: event.id,
+            eventName: event.name,
+            requiredAmount,
+            amountPaid,
+            remainingBalance: Math.max(0, requiredAmount - amountPaid),
+          });
+          count.imported++;
+          // The historical amount is kept on the contribution either way; only
+          // receipt-issuing roles also generate a receipt + payment record.
+          if (amountPaid > 0 && canIssueReceipts) {
+            try {
+              await createPayment(student, event, contribution.id, amountPaid, await issueReceipt(student, event, amountPaid, true));
+              count.receipts++;
+            } catch (receiptError) {
+              console.warn("Auto receipt generation failed for an imported row:", receiptError);
+              count.receiptFailed++;
             }
           }
+        } catch (error) {
+          // A concurrent writer created the same student+event pair.
+          if (isDuplicateError(error)) skipped++;
+          else {
+            count.failed++;
+            console.error("Error importing a contribution row:", error);
+          }
         }
-      };
+      }
+    };
 
-      await Promise.all(
-        Array.from(
-          {
-            length: Math.min(CONCURRENCY, deduped.length),
-          },
-          worker,
-        ),
+    try {
+      await Promise.all(Array.from({ length: Math.min(IMPORT_CONCURRENCY, queue.length) }, worker));
+      toast.success(
+        [
+          `${count.imported} contribution(s) imported`,
+          count.failed && `${count.failed} contribution(s) failed`,
+          count.receipts && `${count.receipts} receipt(s) generated`,
+          skipped && `${skipped} skipped`,
+          count.receiptFailed && `${count.receiptFailed} receipt(s) failed`,
+        ]
+          .filter(Boolean)
+          .join(", "),
       );
-
-      // Combine all reasons rows may have been skipped.
-      const totalSkipped =
-        unmatchedStudent +
-        unmatchedEvent +
-        invalidAmount +
-        duplicateCount +
-        raceDuplicates;
-
-      const parts = [`${successfulImports} contribution(s) imported`];
-      if (importFailures > 0) {
-        parts.push(`${importFailures} contribution(s) failed`);
-      }
-
-      if (receiptsIssued > 0) {
-        parts.push(`${receiptsIssued} receipt(s) generated`);
-      }
-
-      if (totalSkipped > 0) {
-        parts.push(`${totalSkipped} skipped`);
-      }
-
-      if (receiptFailures > 0) {
-        parts.push(`${receiptFailures} receipt(s) failed`);
-      }
-
-      toast.success(parts.join(", "));
     } catch (error) {
       console.error("Error importing contribution records:", error);
-
       toast.error("Failed to import contribution records");
     } finally {
-      isImportingRef.current = false;
+      importingRef.current = false;
       await loadData();
     }
   };
 
-  // Shared CSV / Excel file-read shell + importing state (row mapping + dedupe
-  // handled by importContributionRows above).
-  const { importing, handleFileSelected, importInputRef } =
-    useSpreadsheetImport({
-      onRows: importContributionRows,
-    });
+  const { importing, handleFileSelected, importInputRef } = useSpreadsheetImport({ onRows: importRows });
+
+  const rowStatus = (payment: PaymentRecord) =>
+    rows.find(
+      (r) => r.id === payment.contributionId || (r.studentId === payment.studentId && r.eventId === payment.eventId),
+    );
 
   return (
-    <SectionLayout
+    <Page
+      eyebrow="Finance"
       title="Contributions & Payments"
-      subtitle="Track balances, record payments, and manage each student's contribution to every event"
+      subtitle="Track balances, record payments, and manage each student's contribution to every event."
       onBack={onBack}
-      headerActions={
+      actions={
         <>
           <button
             onClick={() => importInputRef.current?.click()}
-            className="glass-button px-4 py-2.5 text-sm w-fit"
+            className="btn btn-light"
             disabled={loading || importing}
-            title="Import contribution records from a CSV (.csv) or Excel (.xlsx) file. Expected columns: Student ID / Name, then Event, Required Amount, Amount Paid — repeat that trio for each additional event (as in the official Student Body tracking sheet). A receipt is generated automatically for every imported row with a payment."
+            title={`Import contribution records from a CSV or Excel (.xlsx) file. ${IMPORT_HINT} A receipt is generated for every imported row with a payment.`}
           >
-            {importing ? (
-              <Skeleton className="h-4 w-4 rounded-full" />
-            ) : (
-              <FileText className="w-4 h-4" />
-            )}
-            <span>{importing ? "Importing..." : "Upload CSV / Excel"}</span>
+            <FileUp className="h-4 w-4" />
+            {importing ? "Importing…" : "Import CSV / Excel"}
           </button>
-          <button
-            onClick={openPaymentModal}
-            className="btn-primary px-4 py-2.5 text-sm w-fit"
-            disabled={loading || importing}
-          >
-            <CreditCard className="w-4 h-4" />
-            <span>Record Payment</span>
+          <button onClick={() => setPaymentOpen(true)} className="btn btn-primary" disabled={loading || importing}>
+            Record payment
+            <span className="btn-orb">
+              <ArrowRight className="h-3.5 w-3.5" />
+            </span>
           </button>
         </>
       }
+      hero={
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard featured icon={Wallet} label="Total collected" value={formatPeso(totals.totalPaid)} hint="payments received" />
+          <StatCard icon={Coins} label="Total collectable" value={formatPeso(totals.totalRequired)} hint="required contributions" />
+          <StatCard icon={Scale} tone="warning" label="Outstanding" value={formatPeso(totals.totalBalance)} hint="remaining balances" />
+          <StatCard icon={ListChecks} tone="success" label="Records" value={total.toLocaleString()} hint="matching current filters" />
+        </div>
+      }
     >
-      {/* Hidden file input for CSV / Excel import */}
       <input
         ref={importInputRef}
         type="file"
@@ -947,613 +468,442 @@ export default function ContributionManagementSection({
         onChange={handleFileSelected}
       />
 
-      {/* Summary + Recent Payments */}
-      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_250px] gap-4 mb-4">
-        {/* Recent Payments - Large Left Panel */}
-        <div className="glass-card p-4 lg:p-5 min-w-0">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-9 h-9 rounded-lg bg-red/10 flex items-center justify-center">
-              <CreditCard className="w-4 h-4 text-red" />
-            </div>
-
-            <div>
-              <h3 className="font-display font-semibold text-dark">
-                Recent Payments
-              </h3>
-              <p className="text-xs text-text-secondary">
-                Latest recorded student payments
-              </p>
-            </div>
+      {/* Recent payments */}
+      <section className="card p-5">
+        <div className="mb-4 flex items-center gap-3">
+          <div className="icon-tile">
+            <CreditCard className="h-5 w-5" />
           </div>
-
-          {payments.length === 0 ? (
-            <SectionEmptyState
-              message="No payments recorded yet"
-              icon={CreditCard}
-              compact
-            />
-          ) : (
-            <div className="flex gap-3 overflow-x-auto pb-1">
-              {payments.slice(0, 8).map((payment) => {
-                const paymentContribution = contributions.find(
-                  (contribution) =>
-                    contribution.id === payment.contributionId ||
-                    (contribution.studentId === payment.studentId &&
-                      contribution.eventId === payment.eventId),
-                );
-
-                const paymentStatus = paymentContribution
-                  ? contributionStatus(paymentContribution)
-                  : null;
-
-                return (
-                  <div
-                    key={payment.id}
-                    className="glass-card p-3 min-w-[220px] shrink-0"
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="font-medium text-dark truncate">
-                          {payment.studentName}
-                        </p>
-
-                        <p className="text-xs text-text-secondary truncate">
-                          {payment.eventName}
-                        </p>
-
-                        <p className="text-xs text-text-secondary/70">
-                          {formatDate(payment.date)}
-                        </p>
-                      </div>
-
-                      <div className="text-right shrink-0">
-                        <p className="font-semibold text-green-600">
-                          {formatPeso(payment.amount)}
-                        </p>
-
-                        {paymentStatus && (
-                          <p
-                            className={`text-xs font-semibold ${paymentStatus.className}`}
-                          >
-                            {paymentStatus.label}
-                          </p>
-                        )}
-                      </div>
+          <div>
+            <h2 className="font-bold text-ink">Recent payments</h2>
+            <p className="text-xs text-muted">Latest recorded student payments</p>
+          </div>
+        </div>
+        {payments.length === 0 ? (
+          <EmptyState icon={CreditCard} title="No payments recorded yet" />
+        ) : (
+          <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-1">
+            {payments.slice(0, 8).map((payment) => {
+              const record = rowStatus(payment);
+              return (
+                <div key={payment.id} className="flex min-w-[230px] shrink-0 flex-col gap-2 rounded-2xl border border-line bg-surface-2 p-3.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-ink">{payment.studentName}</p>
+                      <p className="truncate text-xs text-muted">{payment.eventName}</p>
                     </div>
+                    <p className="shrink-0 font-bold text-success">{formatPeso(payment.amount)}</p>
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Summary Cards - Right Side */}
-        <div className="grid grid-cols-3 lg:grid-cols-1 gap-3">
-          <SummaryCard
-            color="blue"
-            value={totalContributions.toLocaleString()}
-            label="Total Records"
-            subtitle="contribution records"
-            compact
-          />
-
-          <SummaryCard
-            color="purple"
-            value={formatPeso(totalRequired)}
-            label="Total Collectable"
-            subtitle="required contributions"
-            compact
-          />
-
-          <SummaryCard
-            color="green"
-            value={formatPeso(totalPaid)}
-            label="Total Collected"
-            subtitle="payments received"
-            compact
-          />
-        </div>
-      </div>
+                  <div className="flex items-center justify-between gap-2 text-xs text-muted">
+                    <span>{formatDate(payment.date)}</span>
+                    {record && <StatusChip record={record} />}
+                    {payment.receiptUrl && (
+                      <button className="btn btn-ghost btn-sm -my-1 -mr-2 px-2" onClick={() => setReceiptUrl(payment.receiptUrl!)}>
+                        <Receipt className="h-3.5 w-3.5" />
+                        Receipt
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* Filters */}
-      <div className="glass-card p-4 mb-4 flex flex-wrap gap-3">
-        <div className="relative flex-1 min-w-[200px]">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-secondary" />
-          <input
-            type="text"
-            placeholder="Search by student name or ID..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="glass-input pl-10 pr-4 py-2 text-sm w-full"
-            disabled={loading}
-          />
-        </div>
+      <div className="flex flex-col gap-3 sm:flex-row">
+        <SearchInput value={search} onChange={setSearch} placeholder="Search by student name or ID…" className="flex-1" />
         <select
-          value={filters.eventId}
-          onChange={(e) =>
-            setFilters((prev) => ({
-              ...prev,
-              eventId: e.target.value,
-            }))
-          }
-          className="glass-input px-4 py-2 text-sm"
-          disabled={loading}
+          value={eventFilter}
+          onChange={(e) => {
+            setEventFilter(e.target.value);
+            setPage(1);
+          }}
+          className="input sm:w-56"
+          aria-label="Filter by event"
         >
-          <option value="">All Events</option>
-          {sortedEvents.map((event) => (
+          <option value="">All events</option>
+          {events.map((event) => (
             <option key={event.id} value={event.id}>
               {event.name}
             </option>
           ))}
         </select>
         <select
-          value={filters.status}
-          onChange={(e) =>
-            setFilters((prev) => ({
-              ...prev,
-              status: e.target.value,
-            }))
-          }
-          className="glass-input px-4 py-2 text-sm"
-          disabled={loading}
+          value={statusFilter}
+          onChange={(e) => {
+            setStatusFilter(e.target.value);
+            setPage(1);
+          }}
+          className="input sm:w-48"
+          aria-label="Filter by status"
         >
-          <option value="">All Statuses</option>
-          <option value="Unpaid">Unpaid</option>
-          <option value="Partial Payment">Partial Payment</option>
-          <option value="Fully Paid">Fully Paid</option>
+          <option value="">All statuses</option>
+          {STATUS_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
         </select>
       </div>
 
-      {/* Loading State */}
-      {loading && <SectionLoader message="Loading contribution records..." />}
-
-      {/* Records Table */}
-      {!loading && (
-        <div className="glass-card overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="glass-table">
-              <thead>
-                <tr>
-                  <th>Student</th>
-                  <th>Event</th>
-                  <th className="text-right">Required</th>
-                  <th className="text-right">Paid</th>
-                  <th className="text-right">Balance</th>
-                  <th>Status</th>
-                  <th className="text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedRecords.map((record) => {
-                  const status = contributionStatus(record);
-                  return (
-                    <tr key={record.id} className="group">
+      {/* Records */}
+      {loading ? (
+        <LoadingCard label="Loading contribution records…" />
+      ) : (
+        <div className="card overflow-hidden">
+          {rows.length === 0 ? (
+            <EmptyState icon={Coins} title="No contribution records found" description="Try a different search or filter, or record a payment." />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Student</th>
+                    <th>Event</th>
+                    <th className="text-right">Required</th>
+                    <th className="text-right">Paid</th>
+                    <th className="text-right">Balance</th>
+                    <th>Status</th>
+                    <th className="w-12" aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((record) => (
+                    <tr key={record.id}>
                       <td>
-                        <div className="flex items-center gap-2">
-                          <div className="w-8 h-8 rounded-full bg-red/10 flex items-center justify-center">
-                            <User className="w-4 h-4 text-red" />
-                          </div>
-                          <div>
-                            <span className="font-medium text-dark block">
-                              {record.studentName}
-                            </span>
-                            <span className="text-xs text-text-secondary">
-                              {record.studentDisplayId}
-                            </span>
-                          </div>
-                        </div>
+                        <p className="font-semibold">{record.studentName}</p>
+                        <p className="text-xs text-muted">{record.studentDisplayId}</p>
                       </td>
                       <td>
-                        <div className="flex items-center gap-1.5">
-                          <Calendar className="w-4 h-4 text-text-secondary" />
-                          <span className="text-text-secondary">
-                            {record.eventName}
-                          </span>
-                        </div>
+                        <span className="inline-flex items-center gap-1.5 text-muted">
+                          <CalendarDays className="h-4 w-4" />
+                          {record.eventName}
+                        </span>
                       </td>
-                      <td className="text-right text-text-secondary">
-                        {formatPeso(record.requiredAmount)}
-                      </td>
-                      <td className="text-right font-medium text-green-600">
-                        {formatPeso(record.amountPaid)}
-                      </td>
-                      <td className="text-right text-text-secondary">
-                        {formatPeso(record.remainingBalance)}
-                      </td>
-                      <td className={`font-medium ${status.className}`}>
-                        {status.label}
+                      <td className="text-right tabular-nums text-muted">{formatPeso(record.requiredAmount)}</td>
+                      <td className="text-right font-semibold tabular-nums text-success">{formatPeso(record.amountPaid)}</td>
+                      <td className="text-right tabular-nums">{formatPeso(record.remainingBalance)}</td>
+                      <td>
+                        <StatusChip record={record} />
                       </td>
                       <td className="text-right">
-                        <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button
-                            onClick={() => openEditModal(record)}
-                            className="p-2 rounded-lg"
-                            title="Edit"
-                          >
-                            <Edit2 className="w-4 h-4 text-blue-600" />
-                          </button>
-                          <button
-                            onClick={() => handleContributionDelete(record)}
-                            className="p-2 rounded-lg hover:bg-red-500/10"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-4 h-4 text-red" />
-                          </button>
-                        </div>
+                        <Menu>
+                          <RowActionsTrigger label={`Actions for ${record.studentName}`} />
+                          <MenuContent>
+                            <MenuItem
+                              onSelect={() =>
+                                setEditForm({
+                                  id: record.id,
+                                  studentId: record.studentId,
+                                  eventId: record.eventId,
+                                  requiredAmount: record.requiredAmount,
+                                  amountPaid: record.amountPaid,
+                                })
+                              }
+                            >
+                              <Pencil />
+                              Edit
+                            </MenuItem>
+                            <MenuSeparator />
+                            <MenuItem danger onSelect={() => setToDelete(record)}>
+                              <Trash2 />
+                              Delete
+                            </MenuItem>
+                          </MenuContent>
+                        </Menu>
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          {records.length === 0 && (
-            <SectionEmptyState
-              message="No contribution records found"
-              icon={Coins}
-              compact
-            />
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
+          <Pagination
+            page={page}
+            totalPages={Math.max(1, Math.ceil(total / PAGE_SIZE))}
+            totalItems={total}
+            pageSize={PAGE_SIZE}
+            onPage={setPage}
+          />
         </div>
       )}
 
-      {/* Stats */}
-      <div className="mt-4 flex flex-wrap gap-4 text-sm text-text-secondary">
-        <span>
-          Total Records:{" "}
-          <strong className="text-dark">{totalContributions}</strong>
-        </span>
-        <span>
-          Filtered: <strong className="text-dark">{records.length}</strong>
-        </span>
-      </div>
+      {editForm && (
+        <EditContributionModal
+          form={editForm}
+          onChange={setEditForm}
+          onSubmit={saveEdit}
+          onClose={() => !saving && setEditForm(null)}
+          students={students}
+          events={events}
+          saving={saving}
+        />
+      )}
 
-      <Pagination
-        page={currentPage}
-        totalPages={totalPages}
-        totalItems={totalContributions}
-        startIndex={(currentPage - 1) * PAGE_SIZE}
-        endIndex={(currentPage - 1) * PAGE_SIZE + paginatedRecords.length}
-        onPrev={() => setCurrentPage((p) => Math.max(1, p - 1))}
-        onNext={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-        onJump={setCurrentPage}
-      />
+      {paymentOpen && (
+        <RecordPaymentModal
+          students={students}
+          events={events}
+          saving={saving}
+          onClose={() => !saving && setPaymentOpen(false)}
+          onSubmit={async (student, event, amount) => (await recordPayment(student, event, amount)) && setPaymentOpen(false)}
+        />
+      )}
 
-      {/* Add/Edit Modal */}
-      <Dialog
-        open={showModal}
-        onOpenChange={(open) => {
-          if (!open && !saving) {
-            setShowModal(false);
-            setEditingRecord(null);
-          }
-        }}
-      >
-        <DialogContent className="glass-card-strong max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              Edit Contribution
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-4 mt-4">
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Student
-              </label>
-              <select
-                value={form.studentId}
-                onChange={(e) =>
-                  setForm({ ...form, studentId: e.target.value })
-                }
-                className="glass-input w-full px-4 py-2"
-                disabled={saving}
-              >
-                <option value="">Select student...</option>
-                {sortedStudents.map((student) => (
-                  <option key={student.id} value={student.id}>
-                    {student.studentId} – {student.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Event
-              </label>
-              <select
-                value={form.eventId}
-                onChange={(e) => setForm({ ...form, eventId: e.target.value })}
-                className="glass-input w-full px-4 py-2"
-                disabled={saving}
-              >
-                <option value="">Select event...</option>
-                {sortedEvents.map((event) => (
-                  <option key={event.id} value={event.id}>
-                    {event.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1">
-                  Required Amount (₱)
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  step={0.01}
-                  value={form.requiredAmount || ""}
-                  onChange={(e) =>
-                    setForm({ ...form, requiredAmount: Number(e.target.value) })
-                  }
-                  className="glass-input w-full px-4 py-2"
-                  placeholder="e.g., 150"
-                  disabled={saving}
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1">
-                  Amount Paid (₱)
-                </label>
-                <input
-                  type="number"
-                  min={0}
-                  step={0.01}
-                  value={form.amountPaid || ""}
-                  onChange={(e) =>
-                    setForm({ ...form, amountPaid: Number(e.target.value) })
-                  }
-                  className="glass-input w-full px-4 py-2"
-                  placeholder="e.g., 0"
-                  disabled={saving}
-                />
-              </div>
-            </div>
-
-            <div className="rounded-xl bg-white/30 border border-white/50 px-4 py-3 flex items-center justify-between text-sm">
-              <span className="text-text-secondary">Remaining Balance</span>
-              <span
-                className={`font-semibold ${computedBalance > 0 ? "text-red-500" : "text-green-600"}`}
-              >
-                {formatPeso(computedBalance)}
-              </span>
-            </div>
-
-            <div className="flex gap-3 pt-4">
-              <button
-                onClick={() => {
-                  setShowModal(false);
-                  setEditingRecord(null);
-                }}
-                className="flex-1 glass-button px-4 py-2.5"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSave}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2"
-                disabled={
-                  saving ||
-                  !form.studentId ||
-                  !form.eventId ||
-                  form.requiredAmount <= 0
-                }
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    <Save className="w-4 h-4" />
-                    Update
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Record Payment Modal (merged in from the former Payments screen) */}
-      <Dialog
-        open={showPaymentModal}
-        onOpenChange={(open) => {
-          if (!open && !saving) {
-            setShowPaymentModal(false);
-          }
-        }}
-      >
-        <DialogContent className="glass-card-strong max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark flex items-center gap-2">
-              <CreditCard className="w-5 h-5 text-red" />
-              Record Payment
-            </DialogTitle>
-          </DialogHeader>
-
-          <form onSubmit={handleRecordPayment} className="space-y-4 mt-4">
-            <div ref={paymentSearchRef} className="relative">
-              <label className="block text-sm font-medium text-dark mb-1">
-                Student
-              </label>
-              <div className="relative">
-                <User className="w-4 h-4 text-text-secondary absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={paymentStudentSearch}
-                  onChange={(e) => {
-                    setPaymentStudentSearch(e.target.value);
-                    setPaymentStudentOpen(true);
-                    if (!e.target.value) {
-                      setPaymentForm((prev) => ({ ...prev, studentId: "" }));
-                    }
-                  }}
-                  onFocus={() => setPaymentStudentOpen(true)}
-                  placeholder="Search by name or student ID..."
-                  className="glass-input w-full pl-10 pr-4 py-2"
-                  disabled={saving}
-                  autoComplete="off"
-                />
-              </div>
-              {paymentStudentOpen && paymentStudentMatches.length > 0 && (
-                <div className="absolute z-10 mt-1 w-full glass-card-strong max-h-56 overflow-y-auto">
-                  {paymentStudentMatches.map((student) => (
-                    <button
-                      type="button"
-                      key={student.id}
-                      onClick={() => handlePaymentStudentSelect(student)}
-                      className="w-full text-left px-4 py-2 hover:bg-white/40 flex items-center gap-2"
-                    >
-                      <User className="w-3.5 h-3.5 text-text-secondary" />
-                      <span className="text-sm text-dark">
-                        {student.name}{" "}
-                        <span className="text-text-secondary flex items-left">
-                          ({student.studentId})
-                        </span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Event
-              </label>
-              <select
-                value={paymentForm.eventId}
-                onChange={(e) =>
-                  setPaymentForm((prev) => ({
-                    ...prev,
-                    eventId: e.target.value,
-                  }))
-                }
-                className="glass-input w-full px-4 py-2"
-                disabled={saving}
-              >
-                <option value="">Select event...</option>
-                {sortedEvents.map((event) => (
-                  <option key={event.id} value={event.id}>
-                    {event.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Amount (₱)
-              </label>
-              <div className="relative">
-                <DollarSign className="w-4 h-4 text-text-secondary absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="number"
-                  min={0}
-                  step={0.01}
-                  value={paymentForm.amount || ""}
-                  onChange={(e) =>
-                    setPaymentForm((prev) => ({
-                      ...prev,
-                      amount: Number(e.target.value),
-                    }))
-                  }
-                  className="glass-input w-full pl-10 pr-4 py-2"
-                  placeholder="e.g., 150"
-                  disabled={saving}
-                />
-              </div>
-            </div>
-
-            {paymentForm.studentId && paymentForm.eventId && (
-              <div className="rounded-xl bg-white/30 border border-white/50 px-4 py-3 space-y-1.5 text-sm">
-                {requiredPaymentAmount !== undefined && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-text-secondary">Required</span>
-                    <span className="font-medium text-dark">
-                      {formatPeso(requiredPaymentAmount)}
-                    </span>
-                  </div>
-                )}
-                {selectedPaymentContribution && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-text-secondary">Already Paid</span>
-                    <span className="font-medium text-dark">
-                      {formatPeso(selectedPaymentContribution.amountPaid)}
-                    </span>
-                  </div>
-                )}
-                {selectedPaymentStatus && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-text-secondary">Status</span>
-                    <span
-                      className={`font-semibold ${selectedPaymentStatus.className}`}
-                    >
-                      {selectedPaymentStatus.label}
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="flex gap-3 pt-2">
-              <button
-                type="button"
-                onClick={() => setShowPaymentModal(false)}
-                className="flex-1 glass-button px-4 py-2.5"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2"
-                disabled={
-                  saving ||
-                  !paymentForm.studentId ||
-                  !paymentForm.eventId ||
-                  paymentForm.amount <= 0
-                }
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                    Recording...
-                  </>
-                ) : (
-                  <>
-                    <Save className="w-4 h-4" />
-                    Record Payment
-                  </>
-                )}
-              </button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      {/* Delete Contribution Confirmation Dialog */}
       <ConfirmDialog
-        open={showDeleteConfirm}
-        onClose={() => {
-          setShowDeleteConfirm(false);
-          setContributionToDelete(null);
-        }}
-        onConfirm={confirmDeleteContribution}
-        title="Delete Contribution"
-        description={`Are you sure you want to delete the contribution record for ${contributionToDelete?.studentName ?? "this student"}?`}
-        warningText={`This action cannot be undone. This student's contribution record for ${contributionToDelete?.eventName ?? ""} will be permanently removed.`}
-        confirmLabel="Delete Contribution"
+        open={!!toDelete}
+        onClose={() => setToDelete(null)}
+        onConfirm={confirmDelete}
+        loading={saving}
+        title="Delete contribution"
+        description={`Delete ${toDelete?.studentName ?? "this student"}'s contribution record for ${toDelete?.eventName ?? "this event"}? This cannot be undone.`}
+        confirmLabel="Delete contribution"
       />
-    </SectionLayout>
+
+      <ReceiptViewer receiptUrl={receiptUrl} onClose={() => setReceiptUrl(null)} title="Payment Receipt" />
+    </Page>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+interface EditContributionModalProps {
+  form: EditForm;
+  onChange: (form: EditForm) => void;
+  onSubmit: (e: FormEvent) => void;
+  onClose: () => void;
+  students: Student[];
+  events: Event[];
+  saving: boolean;
+}
+
+function EditContributionModal({ form, onChange, onSubmit, onClose, students, events, saving }: EditContributionModalProps) {
+  const set = (patch: Partial<EditForm>) => onChange({ ...form, ...patch });
+  const balance = Math.max(0, form.requiredAmount - form.amountPaid);
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Edit contribution"
+      icon={<Pencil className="h-5 w-5" />}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn btn-secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form="edit-contribution"
+            className="btn btn-primary"
+            disabled={saving || !form.studentId || !form.eventId || form.requiredAmount <= 0}
+          >
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form id="edit-contribution" onSubmit={onSubmit} className="space-y-4">
+        <Field label="Student">
+          <select value={form.studentId} onChange={(e) => set({ studentId: e.target.value })} className="input" disabled={saving}>
+            <option value="">Select student…</option>
+            {students.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.studentId} – {s.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Event">
+          <select value={form.eventId} onChange={(e) => set({ eventId: e.target.value })} className="input" disabled={saving}>
+            <option value="">Select event…</option>
+            {events.map((ev) => (
+              <option key={ev.id} value={ev.id}>
+                {ev.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <Field label="Required amount (₱)">
+            <AmountInput value={form.requiredAmount} onChange={(requiredAmount) => set({ requiredAmount })} disabled={saving} />
+          </Field>
+          <Field label="Amount paid (₱)">
+            <AmountInput value={form.amountPaid} onChange={(amountPaid) => set({ amountPaid })} disabled={saving} />
+          </Field>
+        </div>
+        <SummaryLine label="Remaining balance">
+          <span className={cn("font-bold", balance > 0 ? "text-danger" : "text-success")}>{formatPeso(balance)}</span>
+        </SummaryLine>
+      </form>
+    </Modal>
+  );
+}
+
+interface RecordPaymentModalProps {
+  students: Student[];
+  events: Event[];
+  saving: boolean;
+  onClose: () => void;
+  onSubmit: (student: Student, event: Event, amount: number) => void;
+}
+
+function RecordPaymentModal({ students, events, saving, onClose, onSubmit }: RecordPaymentModalProps) {
+  const [student, setStudent] = useState<Student | null>(null);
+  const [studentQuery, setStudentQuery] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [eventId, setEventId] = useState("");
+  const [amount, setAmount] = useState(0);
+  // The selected pair's existing record (may live on any table page, so it is fetched).
+  const [existing, setExisting] = useState<ContributionRecord | null>(null);
+  const lookupRef = useRef(0);
+
+  const event = events.find((ev) => ev.id === eventId);
+  const needle = studentQuery.trim().toLowerCase();
+  const matches =
+    pickerOpen && needle && !student
+      ? students.filter((s) => s.name.toLowerCase().includes(needle) || s.studentId.toLowerCase().includes(needle)).slice(0, 8)
+      : [];
+
+  const lookup = (nextStudent: Student | null, nextEventId: string) => {
+    const id = ++lookupRef.current;
+    setExisting(null);
+    if (!nextStudent || !nextEventId) return;
+    contributionsService
+      .getByStudentAndEvent(nextStudent.id, nextEventId)
+      .then((record) => id === lookupRef.current && setExisting(record))
+      .catch((error) => console.warn("Contribution lookup failed:", error));
+  };
+
+  const required = existing?.requiredAmount ?? event?.allocationAmount;
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (!student || !event) return void toast.error("Please select both student and event");
+    onSubmit(student, event, amount);
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Record payment"
+      description="A contribution record is created automatically on a student's first payment."
+      icon={<CreditCard className="h-5 w-5" />}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn btn-secondary" onClick={onClose} disabled={saving}>
+            Cancel
+          </button>
+          <button type="submit" form="record-payment" className="btn btn-primary" disabled={saving || !student || !eventId || amount <= 0}>
+            {saving ? "Recording…" : "Record payment"}
+          </button>
+        </>
+      }
+    >
+      <form id="record-payment" onSubmit={submit} className="space-y-4">
+        <div className="relative">
+          <Field label="Student">
+            <input
+              value={studentQuery}
+              onChange={(e) => {
+                setStudentQuery(e.target.value);
+                setStudent(null);
+                setPickerOpen(true);
+                lookup(null, eventId);
+              }}
+              onFocus={() => setPickerOpen(true)}
+              onBlur={() => setPickerOpen(false)}
+              placeholder="Search by name or student ID…"
+              className="input"
+              disabled={saving}
+              autoComplete="off"
+            />
+          </Field>
+          {matches.length > 0 && (
+            <ul className="card absolute z-10 mt-1 max-h-56 w-full overflow-y-auto p-1.5 shadow-lift">
+              {matches.map((s) => (
+                <li key={s.id}>
+                  <button
+                    type="button"
+                    // mousedown fires before the input's blur closes the list
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setStudent(s);
+                      setStudentQuery(`${s.name} (${s.studentId})`);
+                      setPickerOpen(false);
+                      lookup(s, eventId);
+                    }}
+                    className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-sm hover:bg-surface-2"
+                  >
+                    <span className="truncate font-medium text-ink">{s.name}</span>
+                    <span className="shrink-0 text-xs text-muted">{s.studentId}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <Field label="Event">
+          <select
+            value={eventId}
+            onChange={(e) => {
+              setEventId(e.target.value);
+              lookup(student, e.target.value);
+            }}
+            className="input"
+            disabled={saving}
+          >
+            <option value="">Select event…</option>
+            {events.map((ev) => (
+              <option key={ev.id} value={ev.id}>
+                {ev.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Amount (₱)">
+          <AmountInput value={amount} onChange={setAmount} disabled={saving} />
+        </Field>
+
+        {student && event && required !== undefined && (
+          <div className="space-y-2 rounded-2xl border border-line bg-surface-2 px-4 py-3 text-sm">
+            <SummaryLine label="Required">{formatPeso(required)}</SummaryLine>
+            {existing && <SummaryLine label="Already paid">{formatPeso(existing.amountPaid)}</SummaryLine>}
+            <SummaryLine label="Status">
+              <StatusChip record={existing ?? { amountPaid: 0, remainingBalance: required }} />
+            </SummaryLine>
+          </div>
+        )}
+      </form>
+    </Modal>
+  );
+}
+
+function AmountInput({ value, onChange, disabled }: { value: number; onChange: (v: number) => void; disabled?: boolean }) {
+  return (
+    <input
+      type="number"
+      min={0}
+      step={0.01}
+      inputMode="decimal"
+      value={value || ""}
+      onChange={(e) => onChange(Number(e.target.value))}
+      placeholder="0.00"
+      className="input tabular-nums"
+      disabled={disabled}
+    />
+  );
+}
+
+function SummaryLine({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-muted">{label}</span>
+      <span className="font-semibold text-ink">{children}</span>
+    </div>
   );
 }

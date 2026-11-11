@@ -1,8 +1,11 @@
-﻿import { useState, useEffect } from "react";
-import { Menu, X, Shield, LogOut, Moon, Sun } from "lucide-react";
-import type { ViewState, UserRole } from "@/types";
-import NotificationBell from "@/components/NotificationBell";
+﻿import { useEffect, useState } from "react";
+import { ChevronDown, LayoutDashboard, LogIn, LogOut, Menu as MenuIcon, Moon, Sun, X } from "lucide-react";
+import type { UserRole, ViewState } from "@/types";
+import { ROLE_LABEL, VIEW_ROLES } from "@/lib/roles";
+import { cn } from "@/lib/utils";
 import { useTheme } from "@/hooks/useTheme";
+import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/Menu";
+import NotificationBell from "@/components/NotificationBell";
 
 interface NavigationProps {
   currentView: ViewState;
@@ -13,407 +16,168 @@ interface NavigationProps {
   studentId?: string;
 }
 
-type NavItem = {
-  label: string;
-  view: ViewState;
-};
+type Link = { label: string; view: ViewState; roles?: UserRole[] };
 
-type ManagementNavItem = {
-  label: string;
-  view: ViewState;
-};
-
-interface ThemeSwitchProps {
-  theme: "light" | "dark";
-  onToggle: () => void;
-}
-
-function ThemeSwitch({ theme, onToggle }: ThemeSwitchProps) {
-  const isDark = theme === "dark";
-
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      className="theme-toggle"
-      aria-label={`${isDark ? "Dark" : "Light"} mode enabled. Switch to ${isDark ? "light" : "dark"} mode`}
-      aria-pressed={isDark}
-      title={`Currently ${isDark ? "dark" : "light"} mode. Click to switch to ${isDark ? "light" : "dark"} mode.`}
-    >
-      <span className={`theme-toggle-track ${isDark ? "theme-toggle-track-dark" : ""}`}>
-        <span className="theme-toggle-thumb">
-          {isDark ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}
-        </span>
-      </span>
-    </button>
-  );
-}
-
-const PUBLIC_NAV_ITEMS: NavItem[] = [
+const PUBLIC_LINKS: Link[] = [
   { label: "Records", view: "landing" },
   { label: "Transparency", view: "transparency" },
-  { label: "Inquiry", view: "inquiry" },
+  { label: "Feedback", view: "inquiry" },
 ];
 
-// Nav items are filtered by the officer's role.
-function buildAdminNavItems(role: UserRole | null): {
-  main: NavItem[];
-  management: ManagementNavItem[];
-} {
-  const management: ManagementNavItem[] = [
-    ...(role
-      ? [{ label: "Events", view: "event-management" as ViewState }]
-      : []),
-    ...(role === "admin" || role === "secretary"
-      ? [{ label: "Reports", view: "report-management" as ViewState }]
-      : []),
+// Staff links are filtered by VIEW_ROLES unless they list their own roles.
+const STAFF_LINKS: Link[] = [
+  { label: "Students", view: "student-management" },
+  { label: "Transparency", view: "transparency", roles: ["board-member"] },
+  { label: "Feedback", view: "feedback-management" },
+];
+const MANAGE_LINKS: Link[] = [
+  { label: "Events", view: "event-management" },
+  { label: "Attendance", view: "attendance-management" },
+  { label: "Contributions", view: "contribution-management" },
+  { label: "Finances", view: "transaction-management" },
+  { label: "Reports", view: "report-management" },
+  { label: "Council Sharing Files", view: "requirement-files-management" },
+];
 
-    ...(role === "admin" || role === "treasurer" || role === "auditor"
-      ? [
-          {
-            label: "Finances",
-            view: "transaction-management" as ViewState,
-          },
-        ]
-      : []),
-    ...(role === "admin" || role === "secretary"
-      ? [{ label: "Attendance", view: "attendance-management" as ViewState }]
-      : []),
+const allowed = (role: UserRole) => (l: Link) => (l.roles ?? VIEW_ROLES[l.view] ?? [role]).includes(role);
 
-    ...(role === "admin" || role === "treasurer" || role === "auditor"
-      ? [
-          {
-            label: "Contributions",
-            view: "contribution-management" as ViewState,
-          },
-        ]
-      : []),
-
-    ...(role
-      ? [
-          {
-            label: "Council Sharing Files",
-            view: "requirement-files-management" as ViewState,
-          },
-        ]
-      : []),
-  ];
-
-  const main: NavItem[] = [
-    { label: "Dashboard", view: "admin-dashboard" },
-
-    ...(role === "admin" || role === "secretary"
-      ? [{ label: "Students", view: "student-management" as ViewState }]
-      : []),
-
-    ...(role === "board-member"
-      ? [{ label: "Transparency", view: "transparency" as ViewState }]
-      : []),
-
-    { label: "Feedback", view: "feedback-management" },
-  ];
-
-  return {
-    main,
-    management,
-  };
-}
-
-export default function Navigation({
-  currentView,
-  onNavigate,
-  role,
-  onLogout,
-  studentId,
-}: NavigationProps) {
-  const [isScrolled, setIsScrolled] = useState(false);
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  const [isManagementOpen, setIsManagementOpen] = useState(false);
+export default function Navigation({ currentView, onNavigate, role, onLogout, studentId }: NavigationProps) {
+  const [scrolled, setScrolled] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const { theme, toggleTheme } = useTheme();
 
-  const isLoggedIn = !!role;
-
-  const adminNav = isLoggedIn
-    ? buildAdminNavItems(role)
-    : { main: [], management: [] };
-
-  const navItems = isLoggedIn ? adminNav.main : PUBLIC_NAV_ITEMS;
-
-  const managementItems = isLoggedIn ? adminNav.management : [];
-
-  const isManagementView = managementItems.some(
-    (item) => item.view === currentView,
-  );
-
   useEffect(() => {
-    const handleScroll = () => {
-      setIsScrolled(window.scrollY > 50);
-    };
-
-    window.addEventListener("scroll", handleScroll, {
-      passive: true,
-    });
-
-    return () => window.removeEventListener("scroll", handleScroll);
+    const onScroll = () => setScrolled(window.scrollY > 24);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
+  const links = role ? STAFF_LINKS.filter(allowed(role)) : PUBLIC_LINKS;
+  const manage = role ? MANAGE_LINKS.filter(allowed(role)) : [];
+  const manageActive = manage.some((l) => l.view === currentView);
+  // Every page starts with a dark .hero-bg band, so white text works until the user scrolls.
+  const solid = scrolled || mobileOpen;
+
   const go = (view: ViewState) => {
+    setMobileOpen(false);
     onNavigate(view);
-    setIsMobileMenuOpen(false);
   };
-
-  const handleLogout = () => {
+  const logout = () => {
+    setMobileOpen(false);
     onLogout();
-
-    // Close any open navigation menus
-    setIsMobileMenuOpen(false);
-    setIsManagementOpen(false);
   };
+
+  const iconBtn = cn("btn btn-icon", solid ? "text-muted hover:bg-surface-2 hover:text-ink" : "text-white/85 hover:bg-white/10 hover:text-white");
+  const pillLink = (active: boolean) =>
+    cn(
+      "btn btn-sm h-9 px-4",
+      active
+        ? solid ? "bg-surface text-brand-600 shadow-soft" : "bg-white text-brand-700"
+        : solid ? "text-muted hover:text-ink" : "text-white/75 hover:text-white",
+    );
+  const sheetLink = (active: boolean) =>
+    cn("w-full rounded-2xl px-4 py-3 text-left text-sm font-semibold transition", active ? "bg-brand-500/10 text-brand-600" : "text-ink hover:bg-surface-2");
 
   return (
-    <nav
-      className={`theme-navigation fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${
-        isScrolled
-          ? "bg-deep-navy/95 backdrop-blur-lg shadow-2xl"
-          : "bg-deep-navy/80 backdrop-blur-md"
-      }`}
-      style={{
-        borderBottom: "1px solid rgba(166,180,226,0.16)",
-      }}
-    >
-      <div className="w-full px-6 lg:px-12">
-        <div className="flex items-center justify-between h-16 lg:h-[4.75rem]">
-          {/* Logo */}
-          <button
-            onClick={() => go("landing")}
-            className="flex items-center gap-3 group p-0"
-          >
-            <img
-              src="/lsc-logo.jpg"
-              alt="Local Student Council logo"
-              className="w-9 h-9 rounded-xl object-cover ring-1 ring-lsc-gold/60 shadow-lg"
-            />
+    <nav className={cn("fixed inset-x-0 top-0 z-40 border-b transition-colors duration-300", solid ? "border-line bg-surface/80 text-ink backdrop-blur-xl" : "border-transparent text-white")}>
+      <div className="mx-auto flex h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:h-[4.5rem] lg:px-8">
+        <button onClick={() => go("landing")} className="flex items-center gap-2.5" aria-label="LSynC home">
+          <img src="/lsc-logo.jpg" alt="" className="h-9 w-9 rounded-full object-cover ring-2 ring-white/30" />
+          <span className="text-lg font-extrabold tracking-tight">
+            LSyn<span className="text-brand-400">C</span>
+          </span>
+        </button>
 
-            <div className="flex flex-col leading-tight">
-              <span className="font-display font-bold text-white text-base tracking-wide group-hover:text-lsc-gold transition-colors">
-                DSSC — LSC
-              </span>
-
-              <span className="text-silver-gray text-[0.65rem] tracking-widest uppercase">
-                Santa Cruz
-              </span>
-            </div>
-          </button>
-
-          {/* Desktop Navigation */}
-          <div className="hidden md:flex items-center gap-8">
-            {/* Main Navigation Items */}
-            {navItems.map((item) => (
-              <button
-                key={item.label}
-                onClick={() => go(item.view)}
-                className={`nav-link text-sm font-medium ${
-                  currentView === item.view ? "active" : ""
-                }`}
-              >
-                {item.label}
+        {/* Desktop: centered pill nav */}
+        <div className="flex flex-1 justify-center">
+          <div className={cn("hidden items-center gap-1 rounded-full border p-1 lg:flex", solid ? "border-line bg-surface-2/70" : "border-white/15 bg-white/10 backdrop-blur")}>
+            {links.map((l) => (
+              <button key={l.view} onClick={() => go(l.view)} className={pillLink(currentView === l.view)}>
+                {l.label}
               </button>
             ))}
+            {manage.length > 0 && (
+              <Menu>
+                <MenuTrigger asChild>
+                  <button className={pillLink(manageActive)}>
+                    Manage <ChevronDown className="h-3.5 w-3.5" />
+                  </button>
+                </MenuTrigger>
+                <MenuContent align="center" sideOffset={10} className="w-56">
+                  {manage.map((l) => (
+                    <MenuItem key={l.view} onSelect={() => go(l.view)} className={cn(currentView === l.view && "text-brand-600")}>
+                      {l.label}
+                    </MenuItem>
+                  ))}
+                </MenuContent>
+              </Menu>
+            )}
+          </div>
+        </div>
 
-            {/* Management Dropdown */}
-            {isLoggedIn && managementItems.length > 0 && (
-              <div className="relative">
-                <button
-                  onClick={() => setIsManagementOpen((prev) => !prev)}
-                  className={`nav-link text-sm font-medium flex items-center gap-1 ${
-                    isManagementView ? "active" : ""
-                  }`}
-                >
-                  <span>Management</span>
+        <div className="flex items-center gap-1">
+          <button onClick={toggleTheme} className={iconBtn} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}>
+            {theme === "dark" ? <Sun className="h-[18px] w-[18px]" /> : <Moon className="h-[18px] w-[18px]" />}
+          </button>
+          <NotificationBell onNavigate={go} isLoggedIn={!!role} studentId={studentId} triggerClassName={iconBtn} />
 
-                  <span
-                    className={`text-xs transition-transform duration-200 ${
-                      isManagementOpen ? "rotate-180" : ""
-                    }`}
-                  >
-                    ▾
-                  </span>
+          <div className="ml-2 hidden items-center gap-2 lg:flex">
+            {role ? (
+              <>
+                <button onClick={() => go("admin-dashboard")} className="btn btn-primary btn-sm h-9" title={`Signed in as ${ROLE_LABEL[role]}`}>
+                  <LayoutDashboard className="h-4 w-4" /> Dashboard
                 </button>
-
-                {isManagementOpen && (
-                  <div className="theme-menu-panel absolute top-full right-0 mt-3 w-52 rounded-xl overflow-hidden shadow-xl">
-                    <div className="p-2">
-                      {managementItems.map((item) => (
-                        <button
-                          key={item.label}
-                          onClick={() => {
-                            go(item.view);
-                            setIsManagementOpen(false);
-                          }}
-                          className={`theme-menu-item w-full text-left px-4 py-3 rounded-lg text-sm font-medium transition-colors ${
-                            currentView === item.view
-                              ? "bg-royal-blue/40 text-lsc-gold"
-                              : "text-secondary hover:text-primary hover:bg-surface-soft"
-                          }`}
-                        >
-                          {item.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Notifications */}
-            <NotificationBell
-              onNavigate={onNavigate}
-              isLoggedIn={isLoggedIn}
-              studentId={studentId}
-            />
-
-            {/* Logout */}
-            {isLoggedIn && (
-              <button
-                onClick={handleLogout}
-                className="flex items-center gap-1.5 text-sm text-silver-gray hover:text-red-400 transition-colors"
-              >
-                <LogOut className="w-4 h-4" />
-                <span>Logout</span>
+                <button onClick={logout} className={iconBtn} aria-label="Log out" title="Log out">
+                  <LogOut className="h-[18px] w-[18px]" />
+                </button>
+              </>
+            ) : (
+              <button onClick={() => go("admin-login")} className="btn btn-primary btn-sm h-9">
+                <LogIn className="h-4 w-4" /> Log in
               </button>
             )}
-
-            {/* Admin Access Link */}
-            {!isLoggedIn && (
-              <button
-                onClick={() => go("admin-login")}
-                className="btn-primary px-4 py-2 text-xs"
-              >
-                <Shield className="w-4 h-4" />
-                <span>Admin access</span>
-              </button>
-            )}
-
-            <ThemeSwitch theme={theme} onToggle={toggleTheme} />
           </div>
 
-          {/* Mobile Actions */}
-          <div className="md:hidden flex items-center gap-1">
-            {/* Notifications */}
-            <NotificationBell
-              onNavigate={go}
-              isLoggedIn={isLoggedIn}
-              studentId={studentId}
-            />
-
-            <ThemeSwitch theme={theme} onToggle={toggleTheme} />
-
-            {/* Mobile Menu Button */}
-            <button
-              onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-              className="p-2 rounded-lg text-white hover:text-lsc-gold transition-colors"
-              aria-label={isMobileMenuOpen ? "Close menu" : "Open menu"}
-            >
-              {isMobileMenuOpen ? (
-                <X className="w-5 h-5" />
-              ) : (
-                <Menu className="w-5 h-5" />
-              )}
-            </button>
-          </div>
+          <button onClick={() => setMobileOpen((o) => !o)} className={cn(iconBtn, "lg:hidden")} aria-label={mobileOpen ? "Close menu" : "Open menu"} aria-expanded={mobileOpen}>
+            {mobileOpen ? <X className="h-5 w-5" /> : <MenuIcon className="h-5 w-5" />}
+          </button>
         </div>
       </div>
 
-      {/* Mobile Menu */}
-      {isMobileMenuOpen && (
-        <div
-          className="theme-menu-panel md:hidden mx-4 mb-4 rounded-xl overflow-hidden"
-        >
-          <div className="flex flex-col gap-1 p-3">
-            {/* Main Navigation Items */}
-            {navItems.map((item) => (
-              <button
-                key={item.label}
-                onClick={() => go(item.view)}
-                className={`theme-menu-item w-full text-left px-4 py-3 rounded-lg font-medium text-sm transition-colors ${
-                  currentView === item.view
-                    ? "bg-royal-blue/40 text-lsc-gold"
-                    : "text-secondary hover:text-primary hover:bg-surface-soft"
-                }`}
-              >
-                {item.label}
-              </button>
-            ))}
-
-            {/* Mobile Management */}
-            {isLoggedIn && managementItems.length > 0 && (
-              <div className="mt-1">
-                <button
-                  onClick={() => setIsManagementOpen((prev) => !prev)}
-                  className={`theme-menu-item w-full text-left px-4 py-3 rounded-lg font-medium text-sm transition-colors flex items-center justify-between ${
-                    isManagementView
-                      ? "bg-royal-blue/40 text-lsc-gold"
-                      : "text-secondary hover:text-primary hover:bg-surface-soft"
-                  }`}
-                >
-                  <span>Management</span>
-
-                  <span
-                    className={`transition-transform duration-200 ${
-                      isManagementOpen ? "rotate-180" : ""
-                    }`}
-                  >
-                    ▾
-                  </span>
+      {/* Mobile: card sheet */}
+      {mobileOpen && (
+        <div className="card mx-4 mb-4 max-h-[calc(100dvh-6rem)] animate-fade-up overflow-y-auto p-2 shadow-lift lg:hidden">
+          {role && <p className="px-4 pb-1 pt-2 text-xs font-semibold text-muted">Signed in as {ROLE_LABEL[role]}</p>}
+          {role && (
+            <button onClick={() => go("admin-dashboard")} className={sheetLink(currentView === "admin-dashboard")}>
+              Dashboard
+            </button>
+          )}
+          {links.map((l) => (
+            <button key={l.view} onClick={() => go(l.view)} className={sheetLink(currentView === l.view)}>
+              {l.label}
+            </button>
+          ))}
+          {manage.length > 0 && (
+            <>
+              <p className="px-4 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-muted">Manage</p>
+              {manage.map((l) => (
+                <button key={l.view} onClick={() => go(l.view)} className={sheetLink(currentView === l.view)}>
+                  {l.label}
                 </button>
-
-                {isManagementOpen && (
-                  <div className="ml-3 mt-1 space-y-1 border-l border-subtle pl-2">
-                    {managementItems.map((item) => (
-                      <button
-                        key={item.label}
-                        onClick={() => {
-                          go(item.view);
-                          setIsManagementOpen(false);
-                        }}
-                        className={`theme-menu-item w-full text-left px-4 py-2.5 rounded-lg text-sm transition-colors ${
-                          currentView === item.view
-                            ? "bg-royal-blue/30 text-lsc-gold"
-                            : "text-secondary hover:text-primary hover:bg-surface-soft"
-                        }`}
-                      >
-                        {item.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Mobile Admin Access */}
-            {!isLoggedIn && (
-              <button
-                onClick={() => go("admin-login")}
-                className="w-full text-left px-4 py-3 rounded-lg font-medium text-sm text-silver-gray hover:text-lsc-gold transition-colors flex items-center gap-2"
-              >
-                <Shield className="w-4 h-4" />
-                <span>Admin Access</span>
+              ))}
+            </>
+          )}
+          <div className="mt-2 border-t border-line p-2">
+            {role ? (
+              <button onClick={logout} className="btn btn-secondary w-full">
+                <LogOut className="h-4 w-4" /> Log out
               </button>
-            )}
-
-            {/* Mobile Logout */}
-            {isLoggedIn && (
-              <>
-                <div className="my-2 border-t border-subtle" />
-
-                <button
-                  onClick={handleLogout}
-                  className="theme-menu-item w-full text-left px-4 py-3 rounded-lg font-medium text-sm text-silver-gray hover:text-red-400 hover:bg-surface-soft transition-colors flex items-center gap-2"
-                >
-                  <LogOut className="w-4 h-4" />
-                  <span>Logout</span>
-                </button>
-              </>
+            ) : (
+              <button onClick={() => go("admin-login")} className="btn btn-primary w-full">
+                <LogIn className="h-4 w-4" /> Log in
+              </button>
             )}
           </div>
         </div>

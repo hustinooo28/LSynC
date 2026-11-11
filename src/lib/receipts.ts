@@ -1,10 +1,6 @@
-// ======================================================================
-// Receipt generation & export (no third-party dependencies)
-// ======================================================================
-// The module supports receipt uploads and the existing generated receipt
-// flows used by contribution records. Transaction ledger receipts are now
-// uploaded physical receipt scans/photos rather than generated automatically.
-// ======================================================================
+// Receipt upload, SVG generation and export (no third-party dependencies).
+// Transaction ledger receipts are uploaded scans; payment/contribution
+// receipts are generated as SVG.
 
 import { getSupabase } from "./supabase";
 
@@ -12,11 +8,7 @@ export type ReceiptFormat = "svg" | "png" | "jpg";
 
 const MAX_UPLOADED_RECEIPT_BYTES = 10 * 1024 * 1024;
 
-/**
- * Uploads a scanned physical receipt or receipt photo to the receipts bucket
- * and returns its public URL. Transaction ledger callers are role-gated in
- * the UI and by the Storage policy.
- */
+/** Uploads a scanned receipt (PDF/image) to the receipts bucket; returns its public URL. */
 export async function uploadReceiptFile(file: File): Promise<string> {
   if (
     file.type !== "application/pdf" &&
@@ -29,33 +21,25 @@ export async function uploadReceiptFile(file: File): Promise<string> {
   }
 
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]+/g, "-");
-  const path = `manual/${crypto.randomUUID()}-${safeName || "receipt"}`;
-  const { error } = await getSupabase().storage.from("receipts").upload(path, file, {
-    upsert: false,
-    contentType: file.type,
-  });
-  if (error) throw new Error(error.message);
-
-  const { data } = getSupabase().storage.from("receipts").getPublicUrl(path);
-  return data.publicUrl;
+  return uploadToBucket(`manual/${crypto.randomUUID()}-${safeName || "receipt"}`, file, file.type);
 }
 
-// ----------------------------------------------------------------------
-// Logo data URI cache (browser-only, fetched once then reused)
-// ----------------------------------------------------------------------
+async function uploadToBucket(path: string, body: Blob, contentType: string): Promise<string> {
+  const bucket = getSupabase().storage.from("receipts");
+  const { error } = await bucket.upload(path, body, { upsert: false, contentType });
+  if (error) throw new Error(error.message);
+  return bucket.getPublicUrl(path).data.publicUrl;
+}
 
 /** Base64 data URIs for the two official logos embedded in every receipt. */
-export interface ReceiptLogoData {
+interface ReceiptLogoData {
   lsc: string;
   dssc: string;
 }
 
 let logoCache: ReceiptLogoData | null = null;
 
-/**
- * Fetches an image from a public path, resizes it to fit within `maxDim`
- * while preserving its aspect ratio, and returns a PNG base64 data URI.
- */
+/** Fetches a public image, fits it within `maxDim` px and returns a PNG data URI. */
 async function imageToDataUri(path: string, maxDim: number): Promise<string> {
   const resp = await fetch(path);
   if (!resp.ok) throw new Error(`Failed to fetch logo ${path}: ${resp.status}`);
@@ -94,12 +78,8 @@ async function imageToDataUri(path: string, maxDim: number): Promise<string> {
   }
 }
 
-/**
- * Returns (and caches) base64 data URIs for both official logos.  The
- * logos are resized to ≤ 100 px on the longest side to keep the SVG
- * receipts lightweight while still looking crisp on screen.
- */
-export async function getReceiptLogos(): Promise<ReceiptLogoData> {
+/** Cached logo data URIs (≤100px keeps the SVG receipts light). */
+async function getReceiptLogos(): Promise<ReceiptLogoData> {
   if (logoCache) return logoCache;
   const [lsc, dssc] = await Promise.all([
     imageToDataUri("/lsc-logo.jpg", 100),
@@ -109,11 +89,7 @@ export async function getReceiptLogos(): Promise<ReceiptLogoData> {
   return logoCache;
 }
 
-/**
- * Shared SVG markup for the official receipt logos. `xlink:href` keeps the
- * embedded images visible in older SVG viewers while `href` serves current
- * browsers. The fixed boxes and preserveAspectRatio prevent distortion.
- */
+/** Logo markup; `xlink:href` keeps the images visible in older SVG viewers. */
 function receiptLogoMarkup(logos: ReceiptLogoData): string {
   return [
     `<image href="${logos.lsc}" xlink:href="${logos.lsc}" x="10" y="10" width="70" height="70" preserveAspectRatio="xMidYMid meet"/>`,
@@ -184,7 +160,7 @@ function threeDigits(n: number): string {
   return words.join(" ");
 }
 
-export function amountInWords(amount: number): string {
+function amountInWords(amount: number): string {
   if (!Number.isFinite(amount)) return "";
   const whole = Math.floor(Math.abs(amount));
   const cents = Math.round((Math.abs(amount) - whole) * 100);
@@ -203,7 +179,7 @@ export function amountInWords(amount: number): string {
   return `${wholeText} Pesos${centsText} only`;
 }
 
-export function buildReceiptSvg(details: ReceiptDetails, logos?: ReceiptLogoData): string {
+function buildReceiptSvg(details: ReceiptDetails, logos?: ReceiptLogoData): string {
   const typeColor = details.type === "income" ? "#0f766e" : "#b91c1c";
   const typeLabel = details.type === "income" ? "COLLECTION" : "EXPENSE";
   const tag = details.tag ? xml(details.tag) : typeLabel;
@@ -225,10 +201,7 @@ export function buildReceiptSvg(details: ReceiptDetails, logos?: ReceiptLogoData
       : []),
   ];
 
-  // Layout is computed from the row count so the TOTAL AMOUNT block and the
-  // footer always stay inside the details box (a third row used to push them
-  // out of the container). The SVG height grows with the rows, so the PNG /
-  // PDF export adapts automatically.
+  // Layout grows with the row count so the total and footer stay inside the box.
   const ROWS_START = 352;              // y of the first detail label
   const ROW_PITCH = 64;                // vertical space per label/value pair
   const lineY = ROWS_START + rows.length * ROW_PITCH - 12; // separator above TOTAL
@@ -279,10 +252,6 @@ ${rowsSvg}
 </svg>`;
 }
 
-// ----------------------------------------------------------------------
-// SVG -> PNG / JPG converters (browser only)
-// ----------------------------------------------------------------------
-
 /** Renders an SVG string onto a canvas (white background, 2x for crispness). */
 async function svgToCanvas(svg: string, scale = 2): Promise<HTMLCanvasElement> {
   const blob = new Blob([svg], { type: "image/svg+xml" });
@@ -308,30 +277,17 @@ async function svgToCanvas(svg: string, scale = 2): Promise<HTMLCanvasElement> {
   }
 }
 
-async function svgToPngBlob(svg: string): Promise<Blob> {
+/** Rasterizes an SVG receipt to PNG or JPG. */
+async function svgToImageBlob(svg: string, format: "png" | "jpg"): Promise<Blob> {
   const canvas = await svgToCanvas(svg);
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("PNG export failed."))),
-      "image/png"
+      (blob) => (blob ? resolve(blob) : reject(new Error(`${format.toUpperCase()} export failed.`))),
+      format === "png" ? "image/png" : "image/jpeg",
+      0.92,
     );
   });
 }
-
-async function svgToJpgBlob(svg: string): Promise<Blob> {
-  const canvas = await svgToCanvas(svg);
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("JPG export failed."))),
-      "image/jpeg",
-      0.92
-    );
-  });
-}
-
-// ----------------------------------------------------------------------
-// Public helpers
-// ----------------------------------------------------------------------
 
 /** Triggers a browser download for a blob. */
 export function downloadBlob(blob: Blob, fileName: string): void {
@@ -349,11 +305,7 @@ export const isSvgUrl = (url: string): boolean => {
   return normalizedUrl.endsWith(".svg") || normalizedUrl.startsWith("data:image/svg+xml");
 };
 
-/**
- * Adds the official logos to older SVG receipts that were generated before
- * logo embedding was enabled. New receipts already contain image elements,
- * so they are returned unchanged.
- */
+/** Adds the logos to old SVG receipts generated before logos were embedded. */
 async function ensureReceiptLogos(svg: string): Promise<string> {
   if (/<image\b/i.test(svg)) return svg;
 
@@ -363,47 +315,18 @@ async function ensureReceiptLogos(svg: string): Promise<string> {
   return svg.replace(/(<rect[^>]*width=["']600["'][^>]*height=["']96["'][^>]*\/?>)/i, `$1\n  ${logoMarkup}`);
 }
 
-/**
- * Local fallback counter for the sequential portion of the Official Receipt
- * (OR) number. It is only used when the database is unavailable (offline), so
- * a valid OR-YYYY-NNNNNN number can still be produced. The authoritative,
- * atomic number always comes from the backend `get_next_or_number()` RPC so
- * numbers are unique and continuous across sessions and devices.
- */
+/** Offline-only fallback for the OR sequence (the RPC is authoritative). */
 let orFallbackSequence = 0;
 
-/** Zero-pads an integer to the given width, e.g. 1 -> "000001". */
-function padSix(n: number): string {
-  return String(n).padStart(6, "0");
-}
-
-/** Current calendar year as a string, e.g. "2026". */
-function currentYear(): string {
-  return String(new Date().getFullYear());
-}
-
-/**
- * Current school year label derived from the system calendar, e.g. "School
- * Year 2026 – 2027". Uses the current year and the following year so the
- * label is always up to date (never hardcoded). Exposed only for the receipt
- * footer fallback when no explicit fiscal year is supplied.
- */
+/** e.g. "School Year 2026 – 2027"; used when no fiscal year is supplied. */
 function dynamicSchoolYear(): string {
   const year = new Date().getFullYear();
   return `School Year ${year} – ${year + 1}`;
 }
 
 /**
- * Returns the next Official Receipt number in the format OR-YYYY-NNNNNN
- * (Official Receipt, current year, six-digit sequential number), e.g.
- * "OR-2026-000001".
- *
- * The next number is allocated atomically by the backend function
- * `public.get_next_or_number()` (which reads the current calendar year from
- * the database server's system clock), so the sequence is unique and
- * continuous across sessions, devices, and years. When the database is
- * unavailable, a local counter keeps producing correctly-formatted numbers so
- * the flow never blocks.
+ * Next Official Receipt number (OR-YYYY-NNNNNN), allocated atomically by the
+ * `get_next_or_number()` RPC; falls back to a local counter when offline.
  */
 export async function officialReceiptNumber(): Promise<string> {
   try {
@@ -419,103 +342,55 @@ export async function officialReceiptNumber(): Promise<string> {
     console.warn("get_next_or_number RPC error:", err);
   }
   orFallbackSequence += 1;
-  return `OR-${currentYear()}-${padSix(orFallbackSequence)}`;
+  return `OR-${new Date().getFullYear()}-${String(orFallbackSequence).padStart(6, "0")}`;
 }
 
-/**
- * Uploads an auto-generated SVG receipt to the public "receipts" bucket and
- * returns its public URL. Throws when storage is not configured/available.
- */
+/** Generates an SVG receipt, uploads it to the "receipts" bucket and returns its public URL. */
 export async function autoCreateReceipt(details: ReceiptDetails): Promise<string> {
-  const logos = await getReceiptLogos();
-  const svg = buildReceiptSvg(details, logos);
-  const path = `auto/${crypto.randomUUID()}.svg`;
-  const { error } = await getSupabase()
-    .storage.from("receipts")
-    .upload(path, new Blob([svg], { type: "image/svg+xml" }), {
-      upsert: false,
-      contentType: "image/svg+xml",
-    });
-  if (error) throw new Error(error.message);
-  const { data } = getSupabase().storage.from("receipts").getPublicUrl(path);
-  return data.publicUrl;
+  const svg = buildReceiptSvg(details, await getReceiptLogos());
+  return uploadToBucket(`auto/${crypto.randomUUID()}.svg`, new Blob([svg], { type: "image/svg+xml" }), "image/svg+xml");
 }
 
-/**
- * Downloads a receipt URL in the requested format. Auto-generated SVG
- * receipts are converted to PNG/JPG on the fly; any other file (photo
- * upload) is downloaded as-is.
- */
-export async function downloadReceipt(
-  url: string,
-  format: ReceiptFormat
-): Promise<string> {
-  const baseName = (url.split("/").pop()?.split("?")[0] || "receipt").replace(/\.[^.]+$/, "");
-
-  if (isSvgUrl(url) && format !== "svg") {
-    const response = await fetch(url, { mode: "cors" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const svg = await ensureReceiptLogos(await response.text());
-    const blob = format === "png" ? await svgToPngBlob(svg) : await svgToJpgBlob(svg);
-    downloadBlob(blob, `${baseName}.${format}`);
-    return format === "png" ? "Receipt downloaded as PNG" : "Receipt downloaded as JPG";
-  }
-
+/** Downloads a receipt URL; SVG receipts can be converted to PNG/JPG, other files download as-is. */
+export async function downloadReceipt(url: string, format: ReceiptFormat): Promise<string> {
+  const fileName = url.split("/").pop()?.split("?")[0] || "receipt";
+  const baseName = fileName.replace(/\.[^.]+$/, "");
   const response = await fetch(url, { mode: "cors" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const blob = isSvgUrl(url)
-    ? new Blob([await ensureReceiptLogos(await response.text())], { type: "image/svg+xml" })
-    : await response.blob();
-  const ext = isSvgUrl(url) ? "svg" : url.split(".").pop()?.split("?")[0] || "png";
-  downloadBlob(blob, `${baseName}.${ext}`);
-  return "Receipt downloaded";
+
+  if (!isSvgUrl(url)) {
+    downloadBlob(await response.blob(), `${baseName}.${url.split(".").pop()?.split("?")[0] || "png"}`);
+    return "Receipt downloaded";
+  }
+  const svg = await ensureReceiptLogos(await response.text());
+  if (format === "svg") {
+    downloadBlob(new Blob([svg], { type: "image/svg+xml" }), `${baseName}.svg`);
+    return "Receipt downloaded";
+  }
+  downloadBlob(await svgToImageBlob(svg, format), `${baseName}.${format}`);
+  return `Receipt downloaded as ${format.toUpperCase()}`;
 }
 
-/**
- * Builds and immediately downloads a contribution-record receipt for the
- * exact Contribution Records table row (student, event, required, paid,
- * balance, status). Unlike {@link autoCreateReceipt} this never talks to the
- * storage bucket, so it works instantly and offline. Supports SVG, PNG, and
- * JPG formats. Returns a success message for the caller's toast.
- */
+/** Builds a contribution receipt locally (no upload); only for records with a payment. */
+async function buildContributionReceipt(details: ReceiptDetails): Promise<string> {
+  if (details.amount <= 0) {
+    throw new Error("Receipt is only available when the paid amount is greater than zero.");
+  }
+  return buildReceiptSvg(details, await getReceiptLogos());
+}
+
+/** Downloads a contribution-record receipt (works offline). Returns a toast message. */
 export async function downloadContributionReceipt(
   details: ReceiptDetails,
-  format: ReceiptFormat = "svg"
+  format: ReceiptFormat = "svg",
 ): Promise<string> {
-  // Enforce that a receipt can only be issued when an actual payment has been
-  // made. This keeps unpaid records from producing receipts even if the UI
-  // button is bypassed, while allowing both partial and fully paid records.
-  if (details.amount <= 0) {
-    throw new Error(
-      "Receipt is only available when the paid amount is greater than zero."
-    );
-  }
-  const logos = await getReceiptLogos();
-  const svg = buildReceiptSvg(details, logos);
-  const baseName = `contribution-receipt-${details.receiptNumber}.${format}`;
-  if (format === "svg") {
-    downloadBlob(new Blob([svg], { type: "image/svg+xml" }), baseName);
-  } else {
-    const blob = format === "png" ? await svgToPngBlob(svg) : await svgToJpgBlob(svg);
-    downloadBlob(blob, baseName);
-  }
+  const svg = await buildContributionReceipt(details);
+  const blob = format === "svg" ? new Blob([svg], { type: "image/svg+xml" }) : await svgToImageBlob(svg, format);
+  downloadBlob(blob, `contribution-receipt-${details.receiptNumber}.${format}`);
   return `Contribution receipt downloaded (${format.toUpperCase()})`;
 }
 
-/**
- * Creates an in-memory SVG URL for previewing a contribution-record receipt.
- * This uses the same receipt markup as the download action, without uploading
- * a temporary file to storage.
- */
-export async function createContributionReceiptPreview(
-  details: ReceiptDetails,
-): Promise<string> {
-  if (details.amount <= 0) {
-    throw new Error(
-      "Receipt is only available when the paid amount is greater than zero."
-    );
-  }
-  const logos = await getReceiptLogos();
-  const svg = buildReceiptSvg(details, logos);
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+/** In-memory data URL for previewing a contribution-record receipt. */
+export async function createContributionReceiptPreview(details: ReceiptDetails): Promise<string> {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(await buildContributionReceipt(details))}`;
 }

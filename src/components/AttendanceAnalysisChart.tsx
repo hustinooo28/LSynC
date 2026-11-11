@@ -1,142 +1,116 @@
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import SectionEmptyState from "@/components/SectionEmptyState";
-import { Calendar } from "lucide-react";
+import { useMemo } from "react";
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { BarChart3 } from "lucide-react";
+import type { AttendanceRecord, Event, Student } from "@/types";
+import { formatDate } from "@/lib/format";
+import EmptyState from "@/components/ui/EmptyState";
 
-export interface AttendanceAnalysisRow {
-  eventId: string;
-  eventName: string;
-  eventLabel: string;
-  totalPopulation: number;
-  actualPopulationAttended: number;
-  attendanceGap: number;
+// Brand-scale pair validated for CVD separation (ΔE ≈ 22) on light and dark surfaces.
+const ATTENDED = "#4B5BFF";
+const GAP = "#70B8FF";
+
+interface Row {
+  id: string;
+  name: string;
+  label: string;
+  total: number;
+  attended: number;
+  gap: number;
+  rate: number;
 }
 
 interface AttendanceAnalysisChartProps {
-  data: AttendanceAnalysisRow[];
+  events: Event[];
+  students: Student[];
+  records: AttendanceRecord[];
 }
 
-/**
- * K-Means attendance comparison line chart + data table.
- * Extracted from the ~120-line JSX block at the bottom of the Attendance tab
- * in EventManagementSection.
- */
-export default function AttendanceAnalysisChart({
-  data,
-}: AttendanceAnalysisChartProps) {
-  if (data.length === 0) {
-    return (
-      <SectionEmptyState
-        message="Create an event to view attendance analysis"
-        icon={Calendar}
-        compact
-      />
-    );
+const Swatch = ({ color }: { color: string }) => <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: color }} />;
+
+/** Per-event comparison of registered students vs. unique students who attended (present or late). */
+export default function AttendanceAnalysisChart({ events, students, records }: AttendanceAnalysisChartProps) {
+  const rows = useMemo<Row[]>(() => {
+    const registered = new Set(students.map((s) => s.id));
+    const total = registered.size;
+    return [...events]
+      .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))
+      .map((event) => {
+        const attended = new Set(
+          records
+            .filter((r) => r.eventId === event.id && r.status !== "absent" && registered.has(r.studentId))
+            .map((r) => r.studentId),
+        ).size;
+        return {
+          id: event.id,
+          name: event.name,
+          label: event.date ? `${event.name} — ${formatDate(event.date)}` : event.name,
+          total,
+          attended,
+          gap: Math.max(0, total - attended),
+          rate: total ? Math.round((attended / total) * 100) : 0,
+        };
+      });
+  }, [events, students, records]);
+
+  if (rows.length === 0) {
+    return <EmptyState icon={BarChart3} title="No events yet" description="Create an event to see its attendance analysis." />;
   }
 
   return (
-    <div className="glass-card-strong p-4 lg:p-5">
-      <div className="mb-4 flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium">
-        <span className="inline-flex items-center gap-2 text-dark">
-          <span className="h-2.5 w-2.5 rounded-full bg-royal-blue" />
-          Total Population
+    <div className="space-y-5">
+      <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium text-muted">
+        <span className="inline-flex items-center gap-2 text-ink">
+          <Swatch color={ATTENDED} /> Attended
         </span>
-        <span className="inline-flex items-center gap-2 text-dark">
-          <span className="h-2.5 w-2.5 rounded-full bg-status-success" />
-          Actual Population Attended
+        <span className="inline-flex items-center gap-2 text-ink">
+          <Swatch color={GAP} /> Attendance gap
         </span>
-        <span className="text-text-secondary">
-          Attendance Gap = Total Population − Actual Population Attended
-        </span>
+        <span>Bar height = total registered students</span>
       </div>
 
-      <div
-        className="h-80 w-full"
-        role="img"
-        aria-label="Line chart comparing total population and actual population attended for each event"
-      >
+      <div className="h-72 w-full" role="img" aria-label="Stacked bar chart of attended students and attendance gap for each event">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart
-            data={data}
-            margin={{ top: 12, right: 24, left: 0, bottom: 8 }}
-          >
-            <CartesianGrid strokeDasharray="3 3" stroke="#B8C1D9" />
+          <BarChart data={rows} margin={{ top: 8, right: 8, left: -12, bottom: 8 }} barCategoryGap="30%">
+            <CartesianGrid vertical={false} stroke="rgb(var(--line))" />
             <XAxis
-              dataKey="eventName"
-              tick={{ fill: "#4A5580", fontSize: 12 }}
+              dataKey="name"
+              tick={{ fill: "rgb(var(--muted))", fontSize: 12 }}
+              tickLine={false}
+              axisLine={{ stroke: "rgb(var(--line))" }}
               interval={0}
               angle={-20}
               textAnchor="end"
               height={60}
             />
-            <YAxis
-              allowDecimals={false}
-              tick={{ fill: "#4A5580", fontSize: 12 }}
-            />
-            <Tooltip
-              labelFormatter={(_, payload) =>
-                payload[0]?.payload.eventLabel ?? "Event"
-              }
-              formatter={(value: number, name: string) => [value, name]}
-              contentStyle={{
-                borderRadius: "0.75rem",
-                borderColor: "#B8C1D9",
-              }}
-            />
-            <Legend />
-            <Line
-              type="monotone"
-              dataKey="totalPopulation"
-              name="Total Population"
-              stroke="#1B2E8C"
-              strokeWidth={3}
-              dot={{ r: 4 }}
-              activeDot={{ r: 6 }}
-            />
-            <Line
-              type="monotone"
-              dataKey="actualPopulationAttended"
-              name="Actual Population Attended"
-              stroke="#2E9E5B"
-              strokeWidth={3}
-              dot={{ r: 4 }}
-              activeDot={{ r: 6 }}
-            />
-          </LineChart>
+            <YAxis allowDecimals={false} tick={{ fill: "rgb(var(--muted))", fontSize: 12 }} tickLine={false} axisLine={false} />
+            <Tooltip cursor={{ fill: "rgb(var(--muted) / 0.08)" }} content={<ChartTooltip />} />
+            <Bar dataKey="attended" name="Attended" stackId="a" fill={ATTENDED} maxBarSize={48} />
+            <Bar dataKey="gap" name="Attendance gap" stackId="a" fill={GAP} radius={[4, 4, 0, 0]} maxBarSize={48} />
+          </BarChart>
         </ResponsiveContainer>
       </div>
 
-      <div className="mt-5 overflow-x-auto">
-        <div className="rounded-xl overflow-hidden border border-gray-200">
-          <table className="glass-table min-w-[680px]">
+      <div className="overflow-hidden rounded-2xl border border-line">
+        <div className="overflow-x-auto">
+          <table className="data-table min-w-[620px]">
             <thead>
               <tr>
                 <th>Event</th>
-                <th className="text-right">Total Population</th>
-                <th className="text-right">Actual Population Attended</th>
-                <th className="text-right">Attendance Gap</th>
+                <th className="text-right">Registered</th>
+                <th className="text-right">Attended</th>
+                <th className="text-right">Gap</th>
+                <th className="text-right">Rate</th>
               </tr>
             </thead>
             <tbody>
-              {data.map((row) => (
-                <tr key={row.eventId}>
-                  <td className="font-medium text-dark">{row.eventLabel}</td>
-                  <td className="text-right text-royal-blue font-medium">
-                    {row.totalPopulation}
-                  </td>
-                  <td className="text-right text-status-success font-medium">
-                    {row.actualPopulationAttended}
-                  </td>
-                  <td className="text-right text-status-danger font-medium">
-                    {row.attendanceGap}
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td className="font-medium">{row.label}</td>
+                  <td className="text-right tabular-nums">{row.total}</td>
+                  <td className="text-right font-semibold tabular-nums">{row.attended}</td>
+                  <td className="text-right tabular-nums text-muted">{row.gap}</td>
+                  <td className="text-right">
+                    <span className={`chip ${row.rate >= 75 ? "chip-success" : row.rate >= 50 ? "chip-warning" : "chip-danger"}`}>{row.rate}%</span>
                   </td>
                 </tr>
               ))}
@@ -144,6 +118,28 @@ export default function AttendanceAnalysisChart({
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ChartTooltip({ active, payload }: { active?: boolean; payload?: { payload: Row }[] }) {
+  const row = payload?.[0]?.payload;
+  if (!active || !row) return null;
+  return (
+    <div className="card space-y-1.5 px-4 py-3 text-xs shadow-lift">
+      <p className="font-semibold text-ink">{row.label}</p>
+      {[
+        [ATTENDED, "Attended", row.attended],
+        [GAP, "Gap", row.gap],
+      ].map(([color, label, value]) => (
+        <p key={label} className="flex items-center gap-2 text-muted">
+          <Swatch color={color as string} />
+          {label} <b className="ml-auto pl-4 text-ink">{value}</b>
+        </p>
+      ))}
+      <p className="text-muted">
+        {row.rate}% of {row.total} registered
+      </p>
     </div>
   );
 }
