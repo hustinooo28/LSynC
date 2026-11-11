@@ -1,10 +1,6 @@
 ﻿import { getSupabase } from "../lib/supabase";
 import { offlineSyncService } from "../lib/offlineSync";
-import {
-  normalizeStudentName,
-  splitSearchWords,
-  escapeLikePattern,
-} from "../lib/utils";
+import { normalizeStudentName, splitSearchWords, escapeLikePattern } from "../lib/utils";
 import type {
   Student,
   Event,
@@ -15,40 +11,43 @@ import type {
   Transaction,
   FeedbackItem,
   FinancialReport,
-  BoardMember,
   StudentRequirementFile,
-  EventEvaluation,
 } from "../types";
 
-// Operational tables use TEXT primary keys so they remain compatible with the
-// former Firestore document-id format. PostgreSQL does not generate a value for
-// a TEXT primary key, therefore every client-created row must receive one.
-const createRecordId = (): string => crypto.randomUUID();
+type Table = Parameters<typeof offlineSyncService.read>[0];
+type Row = Record<string, unknown>;
 
-// The set of tables offlineSyncService knows how to cache/queue, pulled from
-// its own method signature so this file doesn't need a second copy of that
-// union type to stay in sync with.
-type OfflineTable = Parameters<typeof offlineSyncService.read>[0];
+const sb = () => getSupabase();
+// TEXT primary keys (legacy Firestore ids): Postgres never generates them.
+const newId = (): string => crypto.randomUUID();
+const PAGE_SIZE = 1000;
+const REQUIREMENTS_BUCKET = "student-requirements";
 
-/**
- * True when a Supabase/Postgres error is a unique-constraint violation
- * (Postgres error code 23505). Used to turn a duplicate-row insert into a
- * friendly, catchable error instead of a raw Postgres error.
- */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "23505"
-  );
+async function unwrap<T>(query: PromiseLike<{ data: T; error: unknown }>): Promise<T> {
+  const { data, error } = await query;
+  if (error) throw error;
+  return data;
 }
 
-// Shared "online-first, cache-fallback" read pattern used by every getAll().
-async function cachedRead<T>(
-  table: OfflineTable,
-  fetcher: () => Promise<T[]>,
-): Promise<T[]> {
+const isUniqueViolation = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && (error as { code?: string }).code === "23505";
+
+// PostgREST silently caps unranged selects at the project's "Max Rows"
+// setting, so full-table reads page through with .range() until a short page.
+async function fetchAllRows(
+  fetchPage: (from: number, to: number) => PromiseLike<{ data: Row[] | null; error: unknown }>,
+): Promise<Row[]> {
+  const rows: Row[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const page = (await unwrap(fetchPage(from, from + PAGE_SIZE - 1))) ?? [];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) return rows;
+  }
+}
+
+// Online-first full-table read that refreshes the offline cache, falling back
+// to that cache when offline or when the request fails.
+async function cachedRead<T>(table: Table, fetcher: () => Promise<T[]>): Promise<T[]> {
   if (offlineSyncService.isOffline()) {
     const cached = await offlineSyncService.read<T>(table);
     if (cached) return cached;
@@ -64,817 +63,378 @@ async function cachedRead<T>(
   }
 }
 
-// Fetches every row from a query by looping with .range() in batches.
-//
-// A plain .select("*") with no .range()/.limit() is silently capped by
-// PostgREST's project-level "Max Rows" API setting (Settings > API in the
-// Supabase dashboard) — no error, no truncation flag, just a partial array
-// back. This is what caused students to load only ~20 rows even though the
-// code never set any limit. Looping with .range() until a page comes back
-// short makes getAll() immune to that setting regardless of what it's set
-// to, the same way contributionsService.getAll() already worked around it.
-async function fetchAllRows<Row>(
-  fetchPage: (
-    from: number,
-    to: number,
-  ) => PromiseLike<{ data: Row[] | null; error: unknown }>,
-): Promise<Row[]> {
-  const pageSize = 1000;
-  let from = 0;
-  const allData: Row[] = [];
-
-  while (true) {
-    const { data, error } = await fetchPage(from, from + pageSize - 1);
-
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-
-    allData.push(...data);
-
-    if (data.length < pageSize) break;
-    from += pageSize;
+// Filtered read: never writes the table cache (a subset would overwrite the
+// full table), but falls back to filtering the cached full table.
+async function cachedQuery<T>(
+  table: Table,
+  fetcher: () => Promise<T[]>,
+  fallbackFilter: (record: T) => boolean,
+): Promise<T[]> {
+  const fromCache = async () => (await offlineSyncService.read<T>(table))?.filter(fallbackFilter);
+  if (offlineSyncService.isOffline()) {
+    const cached = await fromCache();
+    if (cached) return cached;
   }
-
-  return allData;
+  try {
+    return await fetcher();
+  } catch (error) {
+    const cached = await fromCache();
+    if (cached) return cached;
+    throw error;
+  }
 }
 
-// In-memory, session-lifetime cache for students/events, sitting in front
-// of the network fetch inside their getAll(). Every section that needs the
-// full student or event list (for name lookups, dropdowns, totals...)
-// currently calls getAll() independently on its own mount, so switching
-// tabs re-fetches both entire tables from scratch every time even when
-// nothing changed. This makes the first fetch each session serve every
-// later caller until something invalidates it.
-//
-// This is intentionally NOT folded into cachedRead() itself: several other
-// tables behind cachedRead (attendance, in particular) have multiple
-// callers issuing *different* server-side-filtered queries under the same
-// table name (getAll() vs. getByStudentId() vs. getByEventIdAndSession()).
-// A table-keyed cache there would risk one caller's filtered result
-// leaking into another caller expecting the full table, or vice versa.
-// students/events only ever have a single unfiltered getAll() behind
-// cachedRead (getByStudentId/getByName now route through that same
-// getAll() instead of keeping their own copy), so caching by table name
-// here is safe — don't extend this map to other tables without checking
-// that same invariant first.
-const referenceDataCache = new Map<"students" | "events", unknown[]>();
+// Session-lifetime memo for the small reference tables every section loads
+// (students, events). Stores the in-flight promise so concurrent mounts share
+// one request; writes and realtime changes invalidate it.
+const memo = new Map<Table, Promise<unknown[]>>();
 
-function invalidateReferenceCache(table: "students" | "events"): void {
-  referenceDataCache.delete(table);
+// ============================================
+// GENERIC TABLE HELPER
+// ============================================
+interface TableSpec<T extends { id: string }> {
+  name: Table;
+  /** camelCase field -> snake_case column. */
+  columns: { [K in Exclude<keyof T, "id">]-?: string };
+  /** Fields whose null/"" column value maps to undefined. */
+  optional?: (keyof T)[];
+  /** Extra per-row fixes beyond a plain rename. */
+  fix?: (record: T, row: Row) => T;
+  order: { column: string; ascending: boolean };
+  memoize?: boolean;
+  duplicateMessage?: string;
 }
 
-const mapEvent = (item: Record<string, unknown>): Event => {
-  // Handle schedules that might be stored as JSON string or array
-  let schedules: EventSchedule[] = [];
-  if (Array.isArray(item.schedules)) {
-    schedules = item.schedules as EventSchedule[];
-  } else if (typeof item.schedules === "string") {
-    try {
-      const parsed = JSON.parse(item.schedules);
-      schedules = Array.isArray(parsed) ? parsed : [];
-    } catch {
-      schedules = [];
+function defineTable<T extends { id: string }>(spec: TableSpec<T>) {
+  const { name, columns, order } = spec;
+  const entries = Object.entries(columns) as [keyof T & string, string][];
+
+  const fromRow = (row: Row): T => {
+    const record: Row = { id: row.id };
+    for (const [key, column] of entries) {
+      const value = row[column];
+      record[key] = spec.optional?.includes(key) && (value == null || value === "") ? undefined : value;
     }
-  }
+    return spec.fix ? spec.fix(record as T, row) : (record as T);
+  };
+
+  const toRow = (record: Partial<T>): Row => {
+    const row: Row = {};
+    for (const [key, column] of entries) if (record[key] !== undefined) row[column] = record[key];
+    return row;
+  };
+
+  const invalidate = () => {
+    if (spec.memoize) memo.delete(name);
+  };
+
+  const fetchAll = async (): Promise<T[]> => {
+    const rows = await fetchAllRows((from, to) => {
+      let query = sb().from(name).select("*").order(order.column, { ascending: order.ascending });
+      // Unique tie-breaker so range() pages never skip/duplicate rows.
+      if (order.column !== "id") query = query.order("id");
+      return query.range(from, to);
+    });
+    return rows.map(fromRow);
+  };
+
+  const singleRow = async (query: PromiseLike<{ data: Row | null; error: unknown }>): Promise<T> => {
+    try {
+      return fromRow((await unwrap(query)) as Row);
+    } catch (error) {
+      if (spec.duplicateMessage && isUniqueViolation(error)) throw new Error(spec.duplicateMessage);
+      throw error;
+    }
+  };
+
+  const ensure = (result: T | undefined, action: string): T => {
+    if (!result) throw new Error(`Failed to ${action} ${name} record`);
+    return result;
+  };
 
   return {
-    id: item.id as string,
-    name: item.name as string,
-    allocationAmount: item.allocation_amount as number,
-    date: (item.date as string | null) ?? undefined,
-    contributionDeadline:
-      (item.contribution_deadline as string | null) || undefined,
-    evaluationActive: Boolean(item.evaluation_active),
-    evaluationFormUrl: (item.evaluation_form_url as string | null) || undefined,
-    schedules,
-    timeIn: (item.time_in as string | null) || undefined,
-    timeOut: (item.time_out as string | null) || undefined,
-    morningTimeIn: (item.morning_time_in as string | null) || undefined,
-    morningTimeOut: (item.morning_time_out as string | null) || undefined,
-    afternoonTimeIn: (item.afternoon_time_in as string | null) || undefined,
-    afternoonTimeOut: (item.afternoon_time_out as string | null) || undefined,
-    eveningTimeIn: (item.evening_time_in as string | null) || undefined,
-    eveningTimeOut: (item.evening_time_out as string | null) || undefined,
+    fromRow,
+    toRow,
+    invalidate,
+
+    getAll(): Promise<T[]> {
+      if (!spec.memoize) return cachedRead(name, fetchAll);
+      let pending = memo.get(name) as Promise<T[]> | undefined;
+      if (!pending) {
+        const request = cachedRead(name, fetchAll);
+        pending = request;
+        memo.set(name, request);
+        request.catch(() => {
+          if (memo.get(name) === request) memo.delete(name);
+        });
+      }
+      return pending;
+    },
+
+    async list(query: PromiseLike<{ data: Row[] | null; error: unknown }>): Promise<T[]> {
+      return ((await unwrap(query)) ?? []).map(fromRow);
+    },
+
+    async create(record: Omit<T, "id">): Promise<T> {
+      const id = newId();
+      const payload = toRow(record as Partial<T>);
+      const result = await offlineSyncService.mutation<T>({
+        table: name,
+        kind: "create",
+        recordId: id,
+        payload,
+        makeLocal: () => ({ ...record, id }) as T,
+        executeOnline: () => singleRow(sb().from(name).insert({ id, ...payload }).select().single()),
+      });
+      invalidate();
+      return ensure(result, "create");
+    },
+
+    async update(id: string, patch: Partial<T>): Promise<T> {
+      const payload = toRow(patch);
+      const result = await offlineSyncService.mutation<T>({
+        table: name,
+        kind: "update",
+        recordId: id,
+        payload,
+        makeLocal: (current) => ({ ...(current as T), ...patch, id }),
+        executeOnline: () => singleRow(sb().from(name).update(payload).eq("id", id).select().single()),
+      });
+      invalidate();
+      return ensure(result, "update");
+    },
+
+    async delete(id: string): Promise<void> {
+      await offlineSyncService.mutation<void>({
+        table: name,
+        kind: "delete",
+        recordId: id,
+        payload: {},
+        executeOnline: () => unwrap(sb().from(name).delete().eq("id", id)).then(() => undefined),
+      });
+      invalidate();
+    },
   };
-};
+}
+
+const byDateDesc = <T extends { date: string }>(a: T, b: T) =>
+  new Date(b.date).getTime() - new Date(a.date).getTime();
+
+/** Students whose name contains every typed word (any order) or whose ID contains the query. */
+async function findStudentRows(query: string): Promise<Row[]> {
+  let byName = sb().from("students").select("*").order("name");
+  for (const word of splitSearchWords(query).map(escapeLikePattern)) {
+    byName = byName.ilike("name", `%${word}%`);
+  }
+  const byId = sb()
+    .from("students")
+    .select("*")
+    .ilike("student_id", `%${escapeLikePattern(query.trim())}%`)
+    .order("name");
+  const [names, ids] = await Promise.all([unwrap(byName), unwrap(byId)]);
+  return [...new Map([...(names ?? []), ...(ids ?? [])].map((row: Row) => [row.id, row])).values()];
+}
 
 // ============================================
-// STUDENTS SERVICE
+// STUDENTS
 // ============================================
+const students = defineTable<Student>({
+  name: "students",
+  columns: { studentId: "student_id", name: "name", program: "program", yearLevel: "year_level", section: "section" },
+  order: { column: "name", ascending: true },
+  memoize: true,
+});
+
+const withNormalizedName = <T extends Partial<Student>>(record: T): T =>
+  record.name === undefined ? record : { ...record, name: normalizeStudentName(record.name) };
+
 export const studentsService = {
-  async getAll(): Promise<Student[]> {
-    const cached = referenceDataCache.get("students");
-    if (cached) return cached as Student[];
-
-    const students = await cachedRead<Student>("students", async () => {
-      const data = await fetchAllRows<Record<string, unknown>>((from, to) =>
-        getSupabase()
-          .from("students")
-          .select("*")
-          .order("name")
-          .range(from, to),
-      );
-
-      return data.map((item) => ({
-        id: item.id as string,
-        studentId: item.student_id as string,
-        name: item.name as string,
-        program: item.program as string,
-        yearLevel: item.year_level as number,
-        section: item.section as string,
-      }));
-    });
-
-    referenceDataCache.set("students", students);
-    return students;
-  },
+  getAll: students.getAll,
 
   async getByStudentId(studentId: string): Promise<Student | null> {
-    // Reuses the already-paginated getAll() instead of keeping a second,
-    // separately-capped copy of the same unranged fetch (which had the
-    // same silent-truncation bug getAll() used to have).
-    const students = await this.getAll();
-
-    return students.find((student) => student.studentId === studentId) ?? null;
+    return (await students.getAll()).find((s) => s.studentId === studentId) ?? null;
   },
 
-  async getByName(name: string): Promise<Student | null> {
-    const students = await this.getAll();
+  create: (student: Omit<Student, "id">) => students.create(withNormalizedName(student)),
+  update: (id: string, record: Partial<Student>) => students.update(id, withNormalizedName(record)),
+  delete: students.delete,
 
-    const searchName = name.toLowerCase();
-
-    return (
-      students.find((student) =>
-        student.name.toLowerCase().includes(searchName),
-      ) ?? null
-    );
-  },
-
-  async create(student: Omit<Student, "id">): Promise<Student> {
-    const id = createRecordId();
-    const normalizedName = normalizeStudentName(student.name);
-    const payload = {
-      student_id: student.studentId,
-      name: normalizedName,
-      program: student.program,
-      year_level: student.yearLevel,
-      section: student.section,
-    };
-
-    const result = await offlineSyncService.mutation<Student>({
-      table: "students",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...student, name: normalizedName }) as Student,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("students")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          name: data.name,
-          program: data.program,
-          yearLevel: data.year_level,
-          section: data.section,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to create student");
-    invalidateReferenceCache("students");
-    return result;
-  },
-
-  async update(id: string, record: Partial<Student>): Promise<Student> {
-    // Normalize before either the outgoing payload or the optimistic local
-    // merge sees it, so both stay in the canonical Title Case format.
-    const normalizedRecord =
-      record.name !== undefined
-        ? { ...record, name: normalizeStudentName(record.name) }
-        : record;
-
-    const updateData: Record<string, unknown> = {};
-
-    if (normalizedRecord.studentId !== undefined)
-      updateData.student_id = normalizedRecord.studentId;
-    if (normalizedRecord.name !== undefined)
-      updateData.name = normalizedRecord.name;
-    if (normalizedRecord.program !== undefined)
-      updateData.program = normalizedRecord.program;
-    if (normalizedRecord.yearLevel !== undefined)
-      updateData.year_level = normalizedRecord.yearLevel;
-    if (normalizedRecord.section !== undefined)
-      updateData.section = normalizedRecord.section;
-
-    const result = await offlineSyncService.mutation<Student>({
-      table: "students",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({ ...(current as Student), ...normalizedRecord, id }) as Student,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("students")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          name: data.name,
-          program: data.program,
-          yearLevel: data.year_level,
-          section: data.section,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update student");
-    invalidateReferenceCache("students");
-    return result;
-  },
-
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "students",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("students")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-    invalidateReferenceCache("students");
-  },
-
-  async createMany(students: Omit<Student, "id">[]): Promise<{
+  // Imports run in small parallel batches; per-row failures (e.g. duplicates)
+  // are reported instead of aborting the batch.
+  async createMany(list: Omit<Student, "id">[]): Promise<{
     created: Student[];
     failed: { index: number; studentId: string; name: string; error: string }[];
   }> {
     const created: Student[] = [];
-    const failed: {
-      index: number;
-      studentId: string;
-      name: string;
-      error: string;
-    }[] = [];
-
-    for (let i = 0; i < students.length; i++) {
-      const student = students[i];
-
-      try {
-        const result = await this.create(student);
-        created.push(result);
-      } catch (error) {
-        failed.push({
-          index: i,
-          studentId: student.studentId,
-          name: student.name,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+    const failed: { index: number; studentId: string; name: string; error: string }[] = [];
+    const BATCH = 10;
+    for (let start = 0; start < list.length; start += BATCH) {
+      const batch = list.slice(start, start + BATCH);
+      const results = await Promise.allSettled(batch.map((s) => studentsService.create(s)));
+      results.forEach((result, offset) => {
+        if (result.status === "fulfilled") return void created.push(result.value);
+        const { studentId, name } = batch[offset];
+        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        failed.push({ index: start + offset, studentId, name, error });
+      });
     }
-
     return { created, failed };
   },
 
   async search(query: string): Promise<Student[]> {
-    // Word-order-agnostic on name: chaining .ilike("name", ...) once per
-    // word ANDs the conditions (PostgREST semantics), so every typed word
-    // must appear somewhere in the name, in any order - "Cruz Juan" still
-    // finds "Juan Dela Cruz". Student IDs aren't multi-word, so those
-    // still match against the query as a whole.
-    const words = splitSearchWords(query).map(escapeLikePattern);
-    const idPattern = `%${escapeLikePattern(query.trim())}%`;
-
-    let nameQuery = getSupabase().from("students").select("*").order("name");
-    for (const word of words) {
-      nameQuery = nameQuery.ilike("name", `%${word}%`);
-    }
-
-    const [byName, byId] = await Promise.all([
-      nameQuery,
-      getSupabase()
-        .from("students")
-        .select("*")
-        .ilike("student_id", idPattern)
-        .order("name"),
-    ]);
-    if (byName.error) throw byName.error;
-    if (byId.error) throw byId.error;
-    const seen = new Map<string, Record<string, unknown>>();
-    [...(byName.data ?? []), ...(byId.data ?? [])].forEach((item) =>
-      seen.set(item.id, item),
-    );
-    return [...seen.values()].map((item) => ({
-      id: item.id as string,
-      studentId: item.student_id as string,
-      name: item.name as string,
-      program: item.program as string,
-      yearLevel: item.year_level as number,
-      section: item.section as string,
-    }));
+    return (await findStudentRows(query)).map(students.fromRow);
   },
 };
 
 // ============================================
-// EVENTS SERVICE
+// EVENTS
 // ============================================
-export const eventsService = {
-  async getAll(): Promise<Event[]> {
-    const cached = referenceDataCache.get("events");
-    if (cached) return cached as Event[];
+function parseSchedules(value: unknown): EventSchedule[] {
+  if (Array.isArray(value)) return value as EventSchedule[];
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
-    const events = await cachedRead<Event>("events", async () => {
-      const data = await fetchAllRows<Record<string, unknown>>((from, to) =>
-        getSupabase()
-          .from("events")
-          .select("*")
-          .order("date", { ascending: false })
-          .range(from, to),
-      );
-
-      return data.map(mapEvent);
-    });
-
-    referenceDataCache.set("events", events);
-    return events;
+const events = defineTable<Event>({
+  name: "events",
+  columns: {
+    name: "name",
+    allocationAmount: "allocation_amount",
+    date: "date",
+    contributionDeadline: "contribution_deadline",
+    evaluationActive: "evaluation_active",
+    evaluationFormUrl: "evaluation_form_url",
+    schedules: "schedules",
   },
-
-  async create(event: Omit<Event, "id">): Promise<Event> {
-    const id = createRecordId();
-    const payload = {
-      name: event.name,
-      allocation_amount: event.allocationAmount,
-      date: event.date,
-      contribution_deadline: event.contributionDeadline ?? "",
-      evaluation_active: event.evaluationActive ?? false,
-      evaluation_form_url: event.evaluationFormUrl ?? "",
-      schedules: event.schedules ?? [],
-      time_in: event.timeIn ?? "",
-      time_out: event.timeOut ?? "",
-      morning_time_in: event.morningTimeIn ?? "",
-      morning_time_out: event.morningTimeOut ?? "",
-      afternoon_time_in: event.afternoonTimeIn ?? "",
-      afternoon_time_out: event.afternoonTimeOut ?? "",
-      evening_time_in: event.eveningTimeIn ?? "",
-      evening_time_out: event.eveningTimeOut ?? "",
-    };
-
-    const result = await offlineSyncService.mutation<Event>({
-      table: "events",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...event }) as Event,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("events")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) throw error;
-        return mapEvent(data);
-      },
-    });
-
-    if (!result) throw new Error("Failed to create event");
-    invalidateReferenceCache("events");
-    return result;
-  },
-
-  async update(id: string, event: Partial<Event>): Promise<Event> {
-    const updateData: Record<string, unknown> = {};
-    if (event.name !== undefined) updateData.name = event.name;
-    if (event.allocationAmount !== undefined)
-      updateData.allocation_amount = event.allocationAmount;
-    if (event.schedules !== undefined) {
-      updateData.schedules = event.schedules;
-    }
-    if (event.date !== undefined) updateData.date = event.date;
-    if (event.contributionDeadline !== undefined)
-      updateData.contribution_deadline = event.contributionDeadline;
-    if (event.evaluationActive !== undefined)
-      updateData.evaluation_active = event.evaluationActive;
-    if (event.evaluationFormUrl !== undefined)
-      updateData.evaluation_form_url = event.evaluationFormUrl;
-    if (event.timeIn !== undefined) updateData.time_in = event.timeIn;
-    if (event.timeOut !== undefined) updateData.time_out = event.timeOut;
-    if (event.morningTimeIn !== undefined)
-      updateData.morning_time_in = event.morningTimeIn;
-    if (event.morningTimeOut !== undefined)
-      updateData.morning_time_out = event.morningTimeOut;
-    if (event.afternoonTimeIn !== undefined)
-      updateData.afternoon_time_in = event.afternoonTimeIn;
-    if (event.afternoonTimeOut !== undefined)
-      updateData.afternoon_time_out = event.afternoonTimeOut;
-    if (event.eveningTimeIn !== undefined)
-      updateData.evening_time_in = event.eveningTimeIn;
-    if (event.eveningTimeOut !== undefined)
-      updateData.evening_time_out = event.eveningTimeOut;
-
-    const result = await offlineSyncService.mutation<Event>({
-      table: "events",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({ ...(current as Event), ...event, id }) as Event,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("events")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return mapEvent(data);
-      },
-    });
-
-    if (!result) throw new Error("Failed to update event");
-    invalidateReferenceCache("events");
-    return result;
-  },
-
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "events",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("events")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-    invalidateReferenceCache("events");
-  },
-};
-
-// ============================================
-// EVENT EVALUATIONS SERVICE
-// ============================================
-// Rows here are written by a per-event Google Apps Script trigger (using
-// the Supabase service role key), not by this app — see
-// supabase/migrations/2026-09-15_event_evaluations.sql and
-// event-evaluation-sync.gs. This service only ever reads.
-const normalizeEvalKey = (value: string): string => value.trim().toLowerCase();
-
-const mapEventEvaluation = (
-  item: Record<string, unknown>,
-): EventEvaluation => ({
-  id: item.id as string,
-  eventId: item.event_id as string,
-  studentId: item.student_id as string,
-  studentName: item.student_name as string,
-  submittedAt: item.submitted_at as string,
+  optional: ["contributionDeadline", "evaluationFormUrl"],
+  fix: (event, row) => ({
+    ...event,
+    date: event.date ?? undefined,
+    evaluationActive: Boolean(event.evaluationActive),
+    schedules: parseSchedules(row.schedules),
+  }),
+  order: { column: "date", ascending: false },
+  memoize: true,
 });
 
+export const eventsService = {
+  getAll: events.getAll,
+  create: (event: Omit<Event, "id">) =>
+    events.create({
+      ...event,
+      contributionDeadline: event.contributionDeadline ?? "",
+      evaluationActive: event.evaluationActive ?? false,
+      evaluationFormUrl: event.evaluationFormUrl ?? "",
+      schedules: event.schedules ?? [],
+    }),
+  update: events.update,
+  delete: events.delete,
+};
+
+// ============================================
+// EVENT EVALUATIONS (rows written by the Apps Script sync; read-only here)
+// ============================================
 export const eventEvaluationsService = {
-  async hasSubmitted(eventId: string, studentId: string): Promise<boolean> {
-    const { data, error } = await getSupabase()
-      .from("event_evaluations")
-      .select("id")
-      .eq("event_id", eventId)
-      .eq("student_id", normalizeEvalKey(studentId))
-      .maybeSingle();
-
-    if (error) throw error;
-    return data !== null;
-  },
-
-  // The record-search gate: returns the most recently rolled-out event the
-  // student hasn't submitted an evaluation for, or null if they're clear.
-  // eventsService.getAll() is already sorted by date descending, so the
-  // first evaluationActive match is "the most recent" per that ordering.
+  /** The most recent evaluation-active event this student hasn't submitted for, or null. */
   async getPendingGate(studentId: string): Promise<Event | null> {
-    const events = await eventsService.getAll();
-    const activeEvent = events.find((event) => event.evaluationActive);
+    const activeEvent = (await events.getAll()).find((event) => event.evaluationActive);
     if (!activeEvent) return null;
-
-    const submitted = await this.hasSubmitted(activeEvent.id, studentId);
-    return submitted ? null : activeEvent;
-  },
-
-  async getForEvent(eventId: string): Promise<EventEvaluation[]> {
-    const { data, error } = await getSupabase()
-      .from("event_evaluations")
-      .select("*")
-      .eq("event_id", eventId)
-      .order("submitted_at", { ascending: false });
-
-    if (error) throw error;
-    return (data ?? []).map(mapEventEvaluation);
+    // limit(1), not maybeSingle(): a duplicate submission must not throw.
+    const rows = await unwrap(
+      sb()
+        .from("event_evaluations")
+        .select("id")
+        .eq("event_id", activeEvent.id)
+        .eq("student_id", studentId.trim().toLowerCase())
+        .limit(1),
+    );
+    return rows && rows.length > 0 ? null : activeEvent;
   },
 };
 
 // ============================================
-// ATTENDANCE SERVICE
+// ATTENDANCE
 // ============================================
+const attendance = defineTable<AttendanceRecord>({
+  name: "attendance",
+  columns: {
+    studentId: "student_id",
+    eventId: "event_id",
+    eventName: "event_name",
+    date: "date",
+    status: "status",
+    session: "session",
+    timeIn: "time_in",
+    timeOut: "time_out",
+  },
+  optional: ["timeIn", "timeOut"],
+  fix: (record) => ({ ...record, session: record.session ?? "morning" }),
+  order: { column: "date", ascending: false },
+});
+
+const attendanceQuery = (filter: (record: AttendanceRecord) => boolean, build: () => PromiseLike<{ data: Row[] | null; error: unknown }>) =>
+  cachedQuery("attendance", () => attendance.list(build()), filter).then((records) => records.sort(byDateDesc));
+
 export const attendanceService = {
-  async getAll(): Promise<AttendanceRecord[]> {
-    return cachedRead<AttendanceRecord>("attendance", async () => {
-      const { data, error } = await getSupabase()
-        .from("attendance")
-        .select("*")
-        .order("date", { ascending: false });
+  getAll: attendance.getAll,
 
-      if (error) throw error;
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          studentId: item.student_id,
-          eventId: item.event_id,
-          eventName: item.event_name,
-          date: item.date,
-          status: item.status,
-          session: (item.session ?? "morning") as
-            | "morning"
-            | "afternoon"
-            | "evening",
-          timeIn: item.time_in ?? undefined,
-          timeOut: item.time_out ?? undefined,
-        })) || []
-      );
-    });
-  },
+  getByStudentId: (studentId: string) =>
+    attendanceQuery(
+      (r) => r.studentId === studentId,
+      () => sb().from("attendance").select("*").eq("student_id", studentId).order("date", { ascending: false }),
+    ),
 
-  async getByStudentId(studentId: string): Promise<AttendanceRecord[]> {
-    return cachedRead<AttendanceRecord>("attendance", async () => {
-      const { data, error } = await getSupabase()
-        .from("attendance")
-        .select("*")
-        .eq("student_id", studentId)
-        .order("date", { ascending: false });
+  getByEventIdAndSession: (eventId: string, session: AttendanceRecord["session"]) =>
+    attendanceQuery(
+      (r) => r.eventId === eventId && r.session === session,
+      () =>
+        sb()
+          .from("attendance")
+          .select("*")
+          .eq("event_id", eventId)
+          .eq("session", session)
+          .order("date", { ascending: false }),
+    ),
 
-      if (error) throw error;
-
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          studentId: item.student_id,
-          eventId: item.event_id,
-          eventName: item.event_name,
-          date: item.date,
-          status: item.status,
-          session: (item.session ?? "morning") as
-            | "morning"
-            | "afternoon"
-            | "evening",
-          timeIn: item.time_in ?? undefined,
-          timeOut: item.time_out ?? undefined,
-        })) || []
-      );
-    }).then((records) =>
-      records
-        .filter((record) => record.studentId === studentId)
-        .sort(
-          (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-        ),
-    );
-  },
-
-  async getByEventIdAndSession(
-    eventId: string,
-    session: "morning" | "afternoon" | "evening",
-  ): Promise<AttendanceRecord[]> {
-    return cachedRead<AttendanceRecord>("attendance", async () => {
-      const { data, error } = await getSupabase()
-        .from("attendance")
-        .select("*")
-        .eq("event_id", eventId)
-        .eq("session", session)
-        .order("date", { ascending: false });
-
-      if (error) throw error;
-
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          studentId: item.student_id,
-          eventId: item.event_id,
-          eventName: item.event_name,
-          date: item.date,
-          status: item.status,
-          session: (item.session ?? session) as
-            | "morning"
-            | "afternoon"
-            | "evening",
-          timeIn: item.time_in ?? undefined,
-          timeOut: item.time_out ?? undefined,
-        })) || []
-      );
-    }).then((records) =>
-      records
-        .filter(
-          (record) => record.eventId === eventId && record.session === session,
-        )
-        .sort(
-          (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-        ),
-    );
-  },
-
-  async create(
-    record: Omit<AttendanceRecord, "id">,
-  ): Promise<AttendanceRecord> {
-    const id = createRecordId();
-    const payload = {
-      student_id: record.studentId,
-      event_id: record.eventId,
-      event_name: record.eventName,
-      date: record.date,
-      status: record.status,
+  create: (record: Omit<AttendanceRecord, "id">) =>
+    attendance.create({
+      ...record,
       session: record.session ?? "morning",
-      time_in: record.timeIn ?? "",
-      time_out: record.timeOut ?? "",
-    };
-
-    const result = await offlineSyncService.mutation<AttendanceRecord>({
-      table: "attendance",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...record }) as AttendanceRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("attendance")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          eventId: data.event_id,
-          eventName: data.event_name,
-          date: data.date,
-          status: data.status,
-          session: (data.session ?? "morning") as
-            | "morning"
-            | "afternoon"
-            | "evening",
-          timeIn: data.time_in ?? undefined,
-          timeOut: data.time_out ?? undefined,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to create attendance record");
-    return result;
-  },
-
-  async update(
-    id: string,
-    record: Partial<AttendanceRecord>,
-  ): Promise<AttendanceRecord> {
-    const updateData: Record<string, unknown> = {};
-    if (record.studentId !== undefined)
-      updateData.student_id = record.studentId;
-    if (record.eventId !== undefined) updateData.event_id = record.eventId;
-    if (record.eventName !== undefined)
-      updateData.event_name = record.eventName;
-    if (record.date !== undefined) updateData.date = record.date;
-    if (record.status !== undefined) updateData.status = record.status;
-    if (record.session !== undefined) updateData.session = record.session;
-    if (record.timeIn !== undefined) updateData.time_in = record.timeIn;
-    if (record.timeOut !== undefined) updateData.time_out = record.timeOut;
-
-    const result = await offlineSyncService.mutation<AttendanceRecord>({
-      table: "attendance",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({
-          ...(current as AttendanceRecord),
-          ...record,
-          id,
-        }) as AttendanceRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("attendance")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          eventId: data.event_id,
-          eventName: data.event_name,
-          date: data.date,
-          status: data.status,
-          session: (data.session ?? "morning") as
-            | "morning"
-            | "afternoon"
-            | "evening",
-          timeIn: data.time_in ?? undefined,
-          timeOut: data.time_out ?? undefined,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update attendance record");
-    return result;
-  },
-
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "attendance",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("attendance")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-  },
+      timeIn: record.timeIn ?? "",
+      timeOut: record.timeOut ?? "",
+    }),
+  update: attendance.update,
+  delete: attendance.delete,
 };
 
 // ============================================
-// CONTRIBUTIONS SERVICE
+// CONTRIBUTIONS
 // ============================================
-export const contributionsService = {
-  /**
-   * Fetch all contributions in batches.
-   *
-   * This remains available for places that genuinely need the complete
-   * contribution dataset, such as legacy/offline workflows.
-   *
-   * Normal paginated screens should use getPage() instead.
-   */
-
-  async getAll(): Promise<ContributionRecord[]> {
-    return cachedRead<ContributionRecord>("contributions", async () => {
-      type ContributionRow = {
-        id: string;
-        student_id: string;
-        event_id: string;
-        event_name: string;
-        required_amount: number;
-        amount_paid: number;
-        remaining_balance: number;
-      };
-
-      const allData = await fetchAllRows<ContributionRow>((from, to) =>
-        getSupabase()
-          .from("contributions")
-          .select("*")
-          .order("id", { ascending: false })
-          .range(from, to),
-      );
-
-      return allData.map((item) => ({
-        id: item.id,
-        studentId: item.student_id,
-        eventId: item.event_id,
-        eventName: item.event_name,
-        requiredAmount: item.required_amount,
-        amountPaid: item.amount_paid,
-        remainingBalance: item.remaining_balance,
-      }));
-    });
+const contributions = defineTable<ContributionRecord>({
+  name: "contributions",
+  columns: {
+    studentId: "student_id",
+    eventId: "event_id",
+    eventName: "event_name",
+    requiredAmount: "required_amount",
+    amountPaid: "amount_paid",
+    remainingBalance: "remaining_balance",
   },
+  order: { column: "id", ascending: false },
+  // UNIQUE (student_id, event_id) is the authoritative double-entry guard.
+  duplicateMessage: "This student already has a contribution record for this event.",
+});
 
-  /**
-   * Fetch one page of contributions directly from PostgreSQL.
-   *
-   * page is zero-based:
-   * page 0 = first page
-   * page 1 = second page
-   */
+export const contributionsService = {
+  /** Every contribution (imports/offline). Paginated screens use getPage(). */
+  getAll: contributions.getAll,
 
+  /** One zero-based page, filtered server-side by search (event name, student name/ID), event and status. */
   async getPage(
     page: number,
     pageSize: number,
@@ -882,183 +442,33 @@ export const contributionsService = {
     eventId = "",
     status = "",
   ): Promise<{ data: ContributionRecord[]; total: number }> {
+    const search = searchTerm.trim();
+    let query = sb().from("contributions").select("*", { count: "exact" }).order("id", { ascending: false });
+
+    if (eventId) query = query.eq("event_id", eventId);
+
+    if (search) {
+      const studentIds = (await findStudentRows(search)).map((row) => row.id as string);
+      const pattern = `%${escapeLikePattern(search).replace(/[,()]/g, "\\$&")}%`;
+      query = studentIds.length
+        ? query.or(`event_name.ilike.${pattern},student_id.in.(${studentIds.join(",")})`)
+        : query.ilike("event_name", pattern);
+    }
+
+    if (status === "unpaid") query = query.eq("amount_paid", 0);
+    else if (status === "partial") query = query.gt("amount_paid", 0).gt("remaining_balance", 0);
+    else if (status === "paid") query = query.lte("remaining_balance", 0);
+
     const from = page * pageSize;
-    const to = from + pageSize - 1;
-    const supabase = getSupabase();
-
-    const normalizedSearch = searchTerm.trim();
-
-    let studentIds: string[] = [];
-
-    /*
-     * SEARCH
-     * -------
-     * Search the students table directly for matching names/student IDs.
-     * The resulting student IDs are then used to search contributions.
-     *
-     * This means the Contributions screen does NOT search only the
-     * currently loaded page.
-     */
-    if (normalizedSearch) {
-      // Word-order-agnostic on name: chaining .ilike("name", ...) once per
-      // word ANDs the conditions, so every typed word must appear
-      // somewhere in the name, in any order - "Cruz Juan" still finds
-      // "Juan Dela Cruz". Same rule as studentsService.search().
-      const words = splitSearchWords(normalizedSearch).map(escapeLikePattern);
-      const escapedSearch = escapeLikePattern(normalizedSearch);
-
-      let nameQuery = supabase.from("students").select("id");
-      for (const word of words) {
-        nameQuery = nameQuery.ilike("name", `%${word}%`);
-      }
-
-      const [nameMatches, idMatches] = await Promise.all([
-        nameQuery,
-
-        supabase
-          .from("students")
-          .select("id")
-          .ilike("student_id", `%${escapedSearch}%`),
-      ]);
-
-      if (nameMatches.error) {
-        throw nameMatches.error;
-      }
-
-      if (idMatches.error) {
-        throw idMatches.error;
-      }
-
-      const matchedIds = new Set<string>();
-
-      for (const student of nameMatches.data ?? []) {
-        matchedIds.add(student.id);
-      }
-
-      for (const student of idMatches.data ?? []) {
-        matchedIds.add(student.id);
-      }
-
-      studentIds = [...matchedIds];
-    }
-
-    /*
-     * BASE CONTRIBUTION QUERY
-     */
-    let query = supabase
-      .from("contributions")
-      .select("*", { count: "exact" })
-      .order("id", { ascending: false });
-
-    /*
-     * EVENT FILTER
-     */
-    if (eventId) {
-      query = query.eq("event_id", eventId);
-    }
-
-    /*
-     * SEARCH FILTER
-     *
-     * Search matches:
-     *   1. event name
-     *   2. student name
-     *   3. student ID
-     *
-     * Student name/ID are resolved to student UUIDs above.
-     */
-    if (normalizedSearch) {
-      const escapedSearch = normalizedSearch
-        .replace(/\\/g, "\\\\")
-        .replace(/%/g, "\\%")
-        .replace(/_/g, "\\_")
-        .replace(/,/g, "\\,")
-        .replace(/\(/g, "\\(")
-        .replace(/\)/g, "\\)");
-
-      const eventSearch = `event_name.ilike.%${escapedSearch}%`;
-
-      if (studentIds.length > 0) {
-        const studentIdSearch = `student_id.in.(${studentIds.join(",")})`;
-        query = query.or(`${eventSearch},${studentIdSearch}`);
-      } else {
-        /*
-         * No matching student was found.
-         * Still allow event-name matches.
-         */
-        query = query.ilike("event_name", `%${escapedSearch}%`);
-      }
-    }
-
-    /*
-     * STATUS FILTER
-     *
-     * Status is derived from amount_paid and remaining_balance:
-     *
-     * unpaid  = nothing has been paid
-     * partial = some payment exists but balance remains
-     * paid    = balance is fully cleared
-     */
-    switch (status) {
-      case "unpaid":
-        query = query.eq("amount_paid", 0);
-        break;
-
-      case "partial":
-        query = query.gt("amount_paid", 0).gt("remaining_balance", 0);
-        break;
-
-      case "paid":
-        query = query.lte("remaining_balance", 0);
-        break;
-
-      default:
-        break;
-    }
-
-    /*
-     * SERVER-SIDE PAGINATION
-     *
-     * count is the number of records matching ALL active filters,
-     * not merely the number of records returned on this page.
-     */
-    const { data, error, count } = await query.range(from, to);
-
-    if (error) {
-      throw error;
-    }
-
-    return {
-      data:
-        data?.map((item) => ({
-          id: item.id,
-          studentId: item.student_id,
-          eventId: item.event_id,
-          eventName: item.event_name,
-          requiredAmount: item.required_amount,
-          amountPaid: item.amount_paid,
-          remainingBalance: item.remaining_balance,
-        })) ?? [],
-      total: count ?? 0,
-    };
-  },
-  /**
-   * Get contribution totals directly from PostgreSQL.
-   *
-   * This avoids downloading thousands of contribution rows just to
-   * calculate the summary cards.
-   */
-  async getTotals(): Promise<{
-    totalRequired: number;
-    totalPaid: number;
-    totalBalance: number;
-  }> {
-    const { data, error } = await getSupabase().rpc("get_contribution_totals");
-
+    const { data, error, count } = await query.range(from, from + pageSize - 1);
     if (error) throw error;
+    return { data: (data ?? []).map(contributions.fromRow), total: count ?? 0 };
+  },
 
+  /** Summary-card totals computed in Postgres. */
+  async getTotals(): Promise<{ totalRequired: number; totalPaid: number; totalBalance: number }> {
+    const data = await unwrap(sb().rpc("get_contribution_totals"));
     const row = Array.isArray(data) ? data[0] : data;
-
     return {
       totalRequired: Number(row?.total_required ?? 0),
       totalPaid: Number(row?.total_paid ?? 0),
@@ -1066,615 +476,115 @@ export const contributionsService = {
     };
   },
 
-  /**
-   * Get collected amount per event directly from PostgreSQL.
-   *
-   * Like getTotals(), this avoids downloading the entire contributions
-   * table just to sum amount_paid per event (what EventManagementSection
-   * used to do with getAll()). Returns a map of eventId -> collected.
-   */
+  /** eventId -> amount collected, computed in Postgres. */
   async getTotalsByEvent(): Promise<Record<string, number>> {
-    const { data, error } = await getSupabase().rpc(
-      "get_event_contribution_totals",
+    const data = await unwrap(sb().rpc("get_event_contribution_totals"));
+    const rows: Row[] = Array.isArray(data) ? data : [];
+    return Object.fromEntries(rows.map((row) => [row.event_id as string, Number(row.collected ?? 0)]));
+  },
+
+  getByStudentId: (studentId: string) =>
+    contributions.list(
+      sb().from("contributions").select("*").eq("student_id", studentId).order("id", { ascending: false }),
+    ),
+
+  async getByStudentAndEvent(studentId: string, eventId: string): Promise<ContributionRecord | null> {
+    const row = await unwrap(
+      sb().from("contributions").select("*").eq("student_id", studentId).eq("event_id", eventId).maybeSingle(),
     );
-
-    if (error) throw error;
-
-    const rows = Array.isArray(data) ? data : [];
-    const totals: Record<string, number> = {};
-    for (const row of rows) {
-      totals[row.event_id as string] = Number(row.collected ?? 0);
-    }
-    return totals;
+    return row ? contributions.fromRow(row) : null;
   },
 
-  /**
-   * Get all contributions belonging to one student.
-   *
-   * This is intentionally server-side and does not download the entire
-   * contributions table.
-   */
-  async getByStudentId(studentId: string): Promise<ContributionRecord[]> {
-    const { data, error } = await getSupabase()
-      .from("contributions")
-      .select("*")
-      .eq("student_id", studentId)
-      .order("id", { ascending: false });
-
-    if (error) throw error;
-
-    return (
-      data?.map((item) => ({
-        id: item.id,
-        studentId: item.student_id,
-        eventId: item.event_id,
-        eventName: item.event_name,
-        requiredAmount: item.required_amount,
-        amountPaid: item.amount_paid,
-        remainingBalance: item.remaining_balance,
-      })) || []
-    );
-  },
-
-  /**
-   * Get exactly one contribution for a student/event pair.
-   *
-   * The database has a unique (student_id, event_id) index, so
-   * maybeSingle() is appropriate here.
-   */
-  async getByStudentAndEvent(
-    studentId: string,
-    eventId: string,
-  ): Promise<ContributionRecord | null> {
-    const { data, error } = await getSupabase()
-      .from("contributions")
-      .select("*")
-      .eq("student_id", studentId)
-      .eq("event_id", eventId)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    if (!data) return null;
-
-    return {
-      id: data.id,
-      studentId: data.student_id,
-      eventId: data.event_id,
-      eventName: data.event_name,
-      requiredAmount: data.required_amount,
-      amountPaid: data.amount_paid,
-      remainingBalance: data.remaining_balance,
-    };
-  },
-
-  async create(
-    record: Omit<ContributionRecord, "id">,
-  ): Promise<ContributionRecord> {
-    const id = createRecordId();
-
-    const payload = {
-      student_id: record.studentId,
-      event_id: record.eventId,
-      event_name: record.eventName,
-      required_amount: record.requiredAmount,
-      amount_paid: record.amountPaid,
-      remaining_balance: record.remainingBalance,
-    };
-
-    const result = await offlineSyncService.mutation<ContributionRecord>({
-      table: "contributions",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...record }) as ContributionRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("contributions")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) {
-          // The contributions table has a UNIQUE (student_id, event_id)
-          // constraint (see the 2026-09-10 migration) as the authoritative
-          // guard against double entry -- callers can catch this specific
-          // message to recover gracefully (e.g. re-fetch and use the
-          // existing record) instead of surfacing a raw Postgres error.
-          if (isUniqueViolation(error)) {
-            throw new Error(
-              "This student already has a contribution record for this event.",
-            );
-          }
-          throw error;
-        }
-
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          eventId: data.event_id,
-          eventName: data.event_name,
-          requiredAmount: data.required_amount,
-          amountPaid: data.amount_paid,
-          remainingBalance: data.remaining_balance,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to create contribution");
-
-    return result;
-  },
-
-  async update(
-    id: string,
-    record: Partial<ContributionRecord>,
-  ): Promise<ContributionRecord> {
-    const updateData: Record<string, unknown> = {};
-
-    if (record.studentId !== undefined)
-      updateData.student_id = record.studentId;
-
-    if (record.eventId !== undefined) updateData.event_id = record.eventId;
-
-    if (record.eventName !== undefined)
-      updateData.event_name = record.eventName;
-
-    if (record.requiredAmount !== undefined)
-      updateData.required_amount = record.requiredAmount;
-
-    if (record.amountPaid !== undefined)
-      updateData.amount_paid = record.amountPaid;
-
-    if (record.remainingBalance !== undefined)
-      updateData.remaining_balance = record.remainingBalance;
-
-    const result = await offlineSyncService.mutation<ContributionRecord>({
-      table: "contributions",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({
-          ...(current as ContributionRecord),
-          ...record,
-          id,
-        }) as ContributionRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("contributions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          eventId: data.event_id,
-          eventName: data.event_name,
-          requiredAmount: data.required_amount,
-          amountPaid: data.amount_paid,
-          remainingBalance: data.remaining_balance,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update contribution");
-
-    return result;
-  },
-
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "contributions",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("contributions")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-  },
+  create: contributions.create,
+  update: contributions.update,
+  delete: contributions.delete,
 };
 
 // ============================================
-// PAYMENTS SERVICE
+// PAYMENTS
 // ============================================
+const payments = defineTable<PaymentRecord>({
+  name: "payments",
+  columns: {
+    studentId: "student_id",
+    studentName: "student_name",
+    eventId: "event_id",
+    eventName: "event_name",
+    contributionId: "contribution_id",
+    amount: "amount",
+    date: "date",
+    receiptUrl: "receipt_url",
+    orNumber: "or_number",
+    recordedBy: "recorded_by",
+  },
+  optional: ["receiptUrl", "orNumber"],
+  fix: (payment) => ({ ...payment, contributionId: payment.contributionId ?? "" }),
+  order: { column: "date", ascending: false },
+});
+
 export const paymentsService = {
-  async getAll(): Promise<PaymentRecord[]> {
-    return cachedRead<PaymentRecord>("payments", async () => {
-      const { data, error } = await getSupabase()
-        .from("payments")
-        .select("*")
-        .order("date", { ascending: false });
-
-      if (error) throw error;
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          studentId: item.student_id,
-          studentName: item.student_name,
-          eventId: item.event_id,
-          eventName: item.event_name,
-          contributionId: item.contribution_id,
-          amount: item.amount,
-          date: item.date,
-          receiptUrl: item.receipt_url || undefined,
-          orNumber: item.or_number || undefined,
-          recordedBy: item.recorded_by,
-        })) || []
-      );
-    });
-  },
-
-  async getByStudentId(studentId: string): Promise<PaymentRecord[]> {
-    const { data, error } = await getSupabase()
-      .from("payments")
-      .select("*")
-      .eq("student_id", studentId)
-      .order("date", { ascending: false });
-
-    if (error) throw error;
-
-    return (
-      data?.map((item) => ({
-        id: item.id,
-        studentId: item.student_id,
-        studentName: item.student_name,
-        eventId: item.event_id,
-        eventName: item.event_name,
-        contributionId: item.contribution_id ?? "",
-        amount: item.amount,
-        date: item.date,
-        receiptUrl: item.receipt_url ?? undefined,
-        orNumber: item.or_number ?? undefined,
-        recordedBy: item.recorded_by,
-      })) || []
-    );
-  },
-
-  async create(record: Omit<PaymentRecord, "id">): Promise<PaymentRecord> {
-    const id = createRecordId();
-    const payload = {
-      student_id: record.studentId,
-      student_name: record.studentName,
-      event_id: record.eventId,
-      event_name: record.eventName,
-      contribution_id: record.contributionId,
-      amount: record.amount,
-      date: record.date,
-      receipt_url: record.receiptUrl,
-      or_number: record.orNumber,
-      recorded_by: record.recordedBy,
-    };
-
-    const result = await offlineSyncService.mutation<PaymentRecord>({
-      table: "payments",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...record }) as PaymentRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("payments")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          studentName: data.student_name,
-          eventId: data.event_id || undefined,
-          eventName: data.event_name || undefined,
-          contributionId: data.contribution_id || undefined,
-          amount: data.amount,
-          date: data.date,
-          receiptUrl: data.receipt_url || undefined,
-          orNumber: data.or_number || undefined,
-          recordedBy: data.recorded_by,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to create payment");
-    return result;
-  },
-
-  async update(
-    id: string,
-    record: Partial<PaymentRecord>,
-  ): Promise<PaymentRecord> {
-    const updateData: Record<string, unknown> = {};
-    if (record.studentId !== undefined)
-      updateData.student_id = record.studentId;
-    if (record.studentName !== undefined)
-      updateData.student_name = record.studentName;
-    if (record.eventId !== undefined) updateData.event_id = record.eventId;
-    if (record.eventName !== undefined)
-      updateData.event_name = record.eventName;
-    if (record.amount !== undefined) updateData.amount = record.amount;
-    if (record.date !== undefined) updateData.date = record.date;
-    if (record.receiptUrl !== undefined)
-      updateData.receipt_url = record.receiptUrl;
-    if (record.orNumber !== undefined) updateData.or_number = record.orNumber;
-    if (record.recordedBy !== undefined)
-      updateData.recorded_by = record.recordedBy;
-
-    const result = await offlineSyncService.mutation<PaymentRecord>({
-      table: "payments",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({ ...(current as PaymentRecord), ...record, id }) as PaymentRecord,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("payments")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          studentId: data.student_id,
-          studentName: data.student_name,
-          eventId: data.event_id || undefined,
-          eventName: data.event_name || undefined,
-          contributionId: data.contribution_id,
-          amount: data.amount,
-          date: data.date,
-          receiptUrl: data.receipt_url || undefined,
-          orNumber: data.or_number || undefined,
-          recordedBy: data.recorded_by,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update payment");
-    return result;
-  },
-
-  // NOT wired to offlineSyncService: this reads a contribution first to find
-  // which payments belong to it, then deletes across two tables. The
-  // mutation() queue only knows how to replay a single { table, kind,
-  // recordId, payload } operation, so a read-then-multi-delete like this
-  // can't be represented as one queued item. It still works fully online;
-  // offline, it will throw like it did before this change. If offline
-  // deletion of contributions/payments turns out to matter, this needs its
-  // own design (e.g. queuing two explicit mutations after reading the
-  // contribution while still online).
-  async delete(id: string): Promise<void> {
-    const supabase = getSupabase();
-
-    // Get the contribution first so we know which student/event it belongs to
-    const { data: contribution, error: contributionError } = await supabase
-      .from("contributions")
-      .select("student_id, event_id")
-      .eq("id", id)
-      .single();
-
-    if (contributionError) throw contributionError;
-
-    // Delete related payments
-    const { error: paymentError } = await supabase
-      .from("payments")
-      .delete()
-      .eq("student_id", contribution.student_id)
-      .eq("event_id", contribution.event_id);
-
-    if (paymentError) throw paymentError;
-
-    // Delete the contribution
-    const { error: contributionDeleteError } = await supabase
-      .from("contributions")
-      .delete()
-      .eq("id", id);
-
-    if (contributionDeleteError) throw contributionDeleteError;
-  },
+  getAll: payments.getAll,
+  getByStudentId: (studentId: string) =>
+    payments.list(sb().from("payments").select("*").eq("student_id", studentId).order("date", { ascending: false })),
+  create: payments.create,
 };
 
 // ============================================
-// TRANSACTIONS SERVICE
+// TRANSACTIONS
 // ============================================
+const transactions = defineTable<Transaction>({
+  name: "transactions",
+  columns: {
+    date: "date",
+    description: "description",
+    eventId: "event_id",
+    eventName: "event_name",
+    amount: "amount",
+    type: "type",
+    responsibleOfficer: "responsible_officer",
+    receiptUrl: "receipt_url",
+  },
+  optional: ["eventId", "eventName", "receiptUrl"],
+  order: { column: "date", ascending: false },
+});
+
 export const transactionsService = {
-  async getAll(): Promise<Transaction[]> {
-    return cachedRead<Transaction>("transactions", async () => {
-      const { data, error } = await getSupabase()
-        .from("transactions")
-        .select("*")
-        .order("date", { ascending: false });
-
-      if (error) throw error;
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          date: item.date,
-          description: item.description,
-          eventId: item.event_id || undefined,
-          eventName: item.event_name || undefined,
-          amount: item.amount,
-          type: item.type,
-          responsibleOfficer: item.responsible_officer,
-          receiptUrl: item.receipt_url || undefined,
-        })) || []
-      );
-    });
-  },
-
-  async create(record: Omit<Transaction, "id">): Promise<Transaction> {
-    const id = createRecordId();
-    const payload = {
-      date: record.date,
-      description: record.description,
-      event_id: record.eventId,
-      event_name: record.eventName,
-      amount: record.amount,
-      type: record.type,
-      responsible_officer: record.responsibleOfficer,
-      receipt_url: record.receiptUrl,
-    };
-
-    const result = await offlineSyncService.mutation<Transaction>({
-      table: "transactions",
-      kind: "create",
-      recordId: id,
-      payload,
-      makeLocal: () => ({ id, ...record }) as Transaction,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("transactions")
-          .insert({ id, ...payload })
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          date: data.date,
-          description: data.description,
-          eventId: data.event_id || undefined,
-          eventName: data.event_name || undefined,
-          amount: data.amount,
-          type: data.type,
-          responsibleOfficer: data.responsible_officer,
-          receiptUrl: data.receipt_url || undefined,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to create transaction");
-    return result;
-  },
-
-  async update(id: string, record: Partial<Transaction>): Promise<Transaction> {
-    const updateData: Record<string, unknown> = {};
-    if (record.date !== undefined) updateData.date = record.date;
-    if (record.description !== undefined)
-      updateData.description = record.description;
-    if (record.eventId !== undefined) updateData.event_id = record.eventId;
-    if (record.eventName !== undefined)
-      updateData.event_name = record.eventName;
-    if (record.amount !== undefined) updateData.amount = record.amount;
-    if (record.type !== undefined) updateData.type = record.type;
-    if (record.responsibleOfficer !== undefined)
-      updateData.responsible_officer = record.responsibleOfficer;
-    if (record.receiptUrl !== undefined)
-      updateData.receipt_url = record.receiptUrl;
-
-    const result = await offlineSyncService.mutation<Transaction>({
-      table: "transactions",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({ ...(current as Transaction), ...record, id }) as Transaction,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("transactions")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          date: data.date,
-          description: data.description,
-          eventId: data.event_id || undefined,
-          eventName: data.event_name || undefined,
-          amount: data.amount,
-          type: data.type,
-          responsibleOfficer: data.responsible_officer,
-          receiptUrl: data.receipt_url || undefined,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update transaction");
-    return result;
-  },
-
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "transactions",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("transactions")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-  },
+  getAll: transactions.getAll,
+  create: transactions.create,
+  update: transactions.update,
+  delete: transactions.delete,
 };
 
 // ============================================
-// FEEDBACK SERVICE
+// FEEDBACK
 // ============================================
-export const feedbackService = {
-  async getAll(): Promise<FeedbackItem[]> {
-    return cachedRead<FeedbackItem>("feedback", async () => {
-      const { data, error } = await getSupabase()
-        .from("feedback")
-        .select("*")
-        .order("submitted_at", { ascending: false });
-
-      if (error) throw error;
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          type: item.type,
-          title: item.title || undefined,
-          message: item.message,
-          studentName: item.student_name || undefined,
-          studentId: item.student_id || undefined,
-          isAnonymous: item.is_anonymous,
-          submittedAt: item.submitted_at,
-          status: item.status,
-        })) || []
-      );
-    });
+const feedback = defineTable<FeedbackItem>({
+  name: "feedback",
+  columns: {
+    type: "type",
+    title: "title",
+    message: "message",
+    studentName: "student_name",
+    studentId: "student_id",
+    isAnonymous: "is_anonymous",
+    submittedAt: "submitted_at",
+    status: "status",
   },
+  optional: ["title", "studentName", "studentId"],
+  order: { column: "submitted_at", ascending: false },
+});
+
+export const feedbackService = {
+  getAll: feedback.getAll,
 
   async getByStatus(status: FeedbackItem["status"]): Promise<FeedbackItem[]> {
-    const feedback = await this.getAll();
-
-    return feedback
-      .filter((item) => item.status === status)
-      .sort(
-        (a, b) =>
-          new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime(),
-      );
+    return (await feedback.getAll()).filter((item) => item.status === status);
   },
 
-  // Returns void to match the original signature. Because there's no
-  // makeLocal here, an offline-queued feedback submission won't appear in
-  // getAll()'s cache until it replays on reconnect (the item is still
-  // queued and will sync - it just isn't reflected locally in the
-  // meantime). Fine for the common case (students submitting feedback
-  // aren't officers, so isEnabled() is false for them and this always goes
-  // straight to executeOnline anyway); revisit if officers need to see
-  // their own offline feedback submissions immediately.
+  // Students submit anonymously and RLS gives them INSERT but not SELECT,
+  // so this inserts without reading the row back.
   async create(item: Omit<FeedbackItem, "id" | "submittedAt">): Promise<void> {
-    const id = createRecordId();
+    const id = newId();
     const payload = {
       type: item.type,
       title: item.title || null,
@@ -1685,178 +595,50 @@ export const feedbackService = {
       submitted_at: new Date().toISOString(),
       status: item.status ?? "pending",
     };
-
     await offlineSyncService.mutation<void>({
       table: "feedback",
       kind: "create",
       recordId: id,
       payload,
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("feedback")
-          .insert({ id, ...payload });
-
-        if (error) {
-          console.error("Feedback insert error:", error);
-          throw error;
-        }
-      },
+      executeOnline: () => unwrap(sb().from("feedback").insert({ id, ...payload })).then(() => undefined),
     });
   },
 
-  async update(id: string, item: Partial<FeedbackItem>): Promise<FeedbackItem> {
-    const updateData: Record<string, unknown> = {};
-    if (item.type !== undefined) updateData.type = item.type;
-    if (item.title !== undefined) updateData.title = item.title;
-    if (item.message !== undefined) updateData.message = item.message;
-    if (item.studentName !== undefined)
-      updateData.student_name = item.studentName;
-    if (item.studentId !== undefined) updateData.student_id = item.studentId;
-    if (item.isAnonymous !== undefined)
-      updateData.is_anonymous = item.isAnonymous;
-    if (item.status !== undefined) updateData.status = item.status;
-
-    const result = await offlineSyncService.mutation<FeedbackItem>({
-      table: "feedback",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({ ...(current as FeedbackItem), ...item, id }) as FeedbackItem,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("feedback")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-
-        if (error) throw error;
-        return {
-          id: data.id,
-          type: data.type,
-          title: data.title || undefined,
-          message: data.message,
-          studentName: data.student_name || undefined,
-          studentId: data.student_id || undefined,
-          isAnonymous: data.is_anonymous,
-          submittedAt: data.submitted_at,
-          status: data.status,
-        };
-      },
-    });
-
-    if (!result) throw new Error("Failed to update feedback");
-    return result;
+  async updateStatus(id: string, status: FeedbackItem["status"]): Promise<void> {
+    await feedback.update(id, { status });
   },
 
-  async delete(id: string): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "feedback",
-      kind: "delete",
-      recordId: id,
-      payload: {},
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("feedback")
-          .delete()
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-  },
-
-  async updateStatus(
-    id: string,
-    status: FeedbackItem["status"],
-  ): Promise<void> {
-    await offlineSyncService.mutation<void>({
-      table: "feedback",
-      kind: "update",
-      recordId: id,
-      payload: { status },
-      executeOnline: async () => {
-        const { error } = await getSupabase()
-          .from("feedback")
-          .update({ status })
-          .eq("id", id);
-
-        if (error) throw error;
-      },
-    });
-  },
+  delete: feedback.delete,
 };
 
 // ============================================
-// BOARD MEMBERS SERVICE
+// REALTIME + FINANCIAL REPORT
 // ============================================
-export const boardMembersService = {
-  // Read-only from this service - board members are created via the
-  // invite-officer script, not through db.ts - so only the cache-fallback
-  // read pattern applies here.
-  async listBoardMembers(): Promise<BoardMember[]> {
-    return cachedRead<BoardMember>("board_members", async () => {
-      const { data, error } = await getSupabase()
-        .from("board_members")
-        .select("*")
-        .order("name");
-      if (error) throw error;
-      return (
-        data?.map((item) => ({
-          id: item.id,
-          name: item.name,
-          accountUserId: item.account_user_id ?? undefined,
-        })) || []
-      );
-    });
-  },
-};
-
-// ============================================
-// FINANCIAL REPORTING SERVICE (derived, no DB writes)
-// ============================================
-
-/**
- * Reload UI data whenever a record in one of its Supabase source tables changes.
- * The caller remains the single source of truth by re-querying the database;
- * this helper never caches or writes duplicate summary data.
- */
+/** Calls onChange whenever a row in any of `tables` changes; returns an unsubscribe. */
 export const subscribeToTables = (
   tables: readonly string[],
   onChange: () => void,
   channelPrefix = "db-live",
 ): (() => void) => {
-  const sb = getSupabase();
-  const channel = sb.channel(`${channelPrefix}-${crypto.randomUUID()}`);
-
+  const client = sb();
+  const channel = client.channel(`${channelPrefix}-${crypto.randomUUID()}`);
   for (const table of tables) {
-    channel.on(
-      "postgres_changes",
-      { event: "*", schema: "public", table },
-      () => {
-        if (table === "students" || table === "events") {
-          invalidateReferenceCache(table);
-        }
-        onChange();
-      },
-    );
+    channel.on("postgres_changes", { event: "*", schema: "public", table }, () => {
+      memo.delete(table as Table);
+      onChange();
+    });
   }
-
   channel.subscribe();
   return () => {
-    void sb.removeChannel(channel);
+    void client.removeChannel(channel);
   };
 };
 
 export const financialReportingService = {
   async getReport(): Promise<FinancialReport> {
-    const { data, error } = await getSupabase().rpc("get_financial_report");
-
-    if (error) throw error;
-
-    if (!data) {
-      return {
+    const data = await unwrap(sb().rpc("get_financial_report"));
+    return (
+      (data as FinancialReport | null) ?? {
         summary: {
           totalBudget: 0,
           totalFundsCollected: 0,
@@ -1865,126 +647,96 @@ export const financialReportingService = {
           totalExpectedContributions: 0,
         },
         eventAllocations: [],
-      };
-    }
-
-    return data as FinancialReport;
+      }
+    );
   },
 
-  subscribe(onChange: () => void): () => void {
-    return subscribeToTables(
+  subscribe: (onChange: () => void) =>
+    subscribeToTables(
       ["events", "students", "contributions", "payments", "transactions"],
       onChange,
       "financial-report",
-    );
-  },
+    ),
 };
 
 // ============================================
-// STUDENT REQUIREMENT FILES SERVICE
+// STUDENT REQUIREMENT FILES
 // ============================================
-const mapStudentRequirementFile = (
-  item: Record<string, unknown>,
-): StudentRequirementFile => ({
-  id: item.id as string,
-  title: item.title as string,
-  description: (item.description as string | null) || undefined,
-  fileUrl: item.file_url as string,
-  fileName: (item.file_name as string) ?? "",
-  fileSize: (item.file_size as number | null) ?? undefined,
-  fileType: (item.file_type as string | null) || undefined,
-  isPublished: (item.is_published as boolean) ?? false,
-  restricted: (item.restricted as boolean) ?? false,
-  createdBy: (item.created_by as string) ?? "",
-  createdAt: (item.created_at as string) ?? "",
-  updatedAt: (item.updated_at as string) ?? "",
+const files = defineTable<StudentRequirementFile>({
+  name: "student_requirement_files",
+  columns: {
+    title: "title",
+    description: "description",
+    fileUrl: "file_url",
+    fileName: "file_name",
+    fileSize: "file_size",
+    fileType: "file_type",
+    isPublished: "is_published",
+    restricted: "restricted",
+    createdBy: "created_by",
+    createdAt: "created_at",
+    updatedAt: "updated_at",
+  },
+  optional: ["description", "fileType", "fileSize"],
+  fix: (file) => ({ ...file, isPublished: Boolean(file.isPublished), restricted: Boolean(file.restricted) }),
+  order: { column: "created_at", ascending: false },
 });
 
+const storagePath = (fileName: string) =>
+  `requirements/${crypto.randomUUID()}.${fileName.split(".").pop()?.toLowerCase() || "pdf"}`;
+
+async function uploadRequirement(path: string, blob: Blob): Promise<string> {
+  const storage = sb().storage.from(REQUIREMENTS_BUCKET);
+  const { error } = await storage.upload(path, blob, { upsert: false, contentType: blob.type });
+  if (error) throw new Error(error.message);
+  return storage.getPublicUrl(path).data.publicUrl;
+}
+
+// Best effort: a leftover object in Storage must never fail the user's action.
+async function removeStoredRequirement(fileUrl: unknown): Promise<void> {
+  const name = typeof fileUrl === "string" ? fileUrl.split("/requirements/")[1] : undefined;
+  if (!name) return;
+  try {
+    await sb().storage.from(REQUIREMENTS_BUCKET).remove([`requirements/${name}`]);
+  } catch (error) {
+    console.warn("Could not remove requirement file from storage:", error);
+  }
+}
+
+const ACCESS_TABLE = "student_requirement_file_access";
+
 export const studentRequirementFilesService = {
-  async getAll(): Promise<StudentRequirementFile[]> {
-    return cachedRead<StudentRequirementFile>(
-      "student_requirement_files",
-      async () => {
-        const { data, error } = await getSupabase()
-          .from("student_requirement_files")
-          .select("*")
-          .order("created_at", { ascending: false });
-        if (error) throw error;
-        return (data ?? []).map(mapStudentRequirementFile);
-      },
-    );
-  },
+  getAll: files.getAll,
 
-  /**
-   * Files a specific student is allowed to see: published files open to
-   * everyone, plus published-but-restricted files where this student is on
-   * the access list. Resolved server-side via get_student_requirement_files
-   * so a restricted file's contents never have to reach a client that
-   * shouldn't see it.
-   */
-  async getVisibleForStudent(
-    studentId: string,
-  ): Promise<StudentRequirementFile[]> {
-    return cachedRead<StudentRequirementFile>(
+  /** Published files this student may see (open + restricted-with-access), resolved server-side. */
+  getVisibleForStudent: (studentId: string) =>
+    cachedQuery(
       "student_requirement_files",
-      async () => {
-        const { data, error } = await getSupabase().rpc(
-          "get_student_requirement_files",
-          { p_student_id: studentId },
-        );
-        if (error) throw error;
-        return (data ?? []).map(mapStudentRequirementFile);
-      },
-    );
-  },
+      async () => ((await unwrap(sb().rpc("get_student_requirement_files", { p_student_id: studentId }))) ?? []).map(files.fromRow),
+      // Offline we can't check access lists, so only show open published files.
+      (file) => file.isPublished && !file.restricted,
+    ),
 
-  /** IDs of students currently on a restricted file's access list. */
   async getAccessList(fileId: string): Promise<string[]> {
-    const { data, error } = await getSupabase()
-      .from("student_requirement_file_access")
-      .select("student_id")
-      .eq("file_id", fileId);
-    if (error) throw error;
-    return (data ?? []).map((row) => row.student_id as string);
+    const rows = await unwrap(sb().from(ACCESS_TABLE).select("student_id").eq("file_id", fileId));
+    return (rows ?? []).map((row) => row.student_id as string);
   },
 
-  /**
-   * Replaces a restricted file's access list with exactly `studentIds`,
-   * diffing against the current list so only the actual additions/removals
-   * hit the database. Network-only (like paymentsService.delete()) -- this
-   * is a compound multi-row op the single-record offline mutation queue
-   * can't represent, and assignment is always done from the Admin console
-   * while online.
-   */
+  /** Replaces a restricted file's access list (online only; diffed so only changes hit the DB). */
   async setAccessList(fileId: string, studentIds: string[]): Promise<void> {
-    const current = await this.getAccessList(fileId);
-    const currentSet = new Set(current);
-    const nextSet = new Set(studentIds);
-
-    const toAdd = studentIds.filter((id) => !currentSet.has(id));
-    const toRemove = current.filter((id) => !nextSet.has(id));
-
-    if (toRemove.length > 0) {
-      const { error } = await getSupabase()
-        .from("student_requirement_file_access")
-        .delete()
-        .eq("file_id", fileId)
-        .in("student_id", toRemove);
-      if (error) throw error;
+    const current = await studentRequirementFilesService.getAccessList(fileId);
+    const toRemove = current.filter((id) => !studentIds.includes(id));
+    const toAdd = [...new Set(studentIds)].filter((id) => !current.includes(id));
+    if (toRemove.length) {
+      await unwrap(sb().from(ACCESS_TABLE).delete().eq("file_id", fileId).in("student_id", toRemove));
     }
-
-    if (toAdd.length > 0) {
+    if (toAdd.length) {
       const now = new Date().toISOString();
-      const { error } = await getSupabase()
-        .from("student_requirement_file_access")
-        .insert(
-          toAdd.map((studentId) => ({
-            file_id: fileId,
-            student_id: studentId,
-            created_at: now,
-          })),
-        );
-      if (error) throw error;
+      await unwrap(
+        sb()
+          .from(ACCESS_TABLE)
+          .insert(toAdd.map((studentId) => ({ file_id: fileId, student_id: studentId, created_at: now }))),
+      );
     }
   },
 
@@ -1996,219 +748,82 @@ export const studentRequirementFilesService = {
     isPublished?: boolean;
     createdBy: string;
   }): Promise<StudentRequirementFile> {
-    const extension = input.fileName.split(".").pop()?.toLowerCase() || "pdf";
-    // Precompute the storage path up front so the queued replay uploads the
-    // blob to the exact same location whether this ran online or offline.
-    const path = `requirements/${crypto.randomUUID()}.${extension}`;
-    const id = createRecordId();
+    // Path is fixed up front so an offline replay uploads to the same place.
+    const path = storagePath(input.fileName);
+    const id = newId();
     const now = new Date().toISOString();
-    const payload = {
+    const local: StudentRequirementFile = {
+      id,
       title: input.title,
-      description: input.description ?? "",
-      // file_url is stamped in during replay (offline) or executeOnline
-      // (online); keeping it in the payload lets replay persist it after the
-      // storage upload completes.
-      file_url: "",
-      file_name: input.fileName,
-      file_size: input.file.size,
-      file_type: input.file.type,
-      is_published: input.isPublished ?? false,
-      created_by: input.createdBy,
-      created_at: now,
-      updated_at: now,
+      description: input.description,
+      fileUrl: "", // stamped after the upload (online or during replay)
+      fileName: input.fileName,
+      fileSize: input.file.size,
+      fileType: input.file.type,
+      isPublished: input.isPublished ?? false,
+      restricted: false,
+      createdBy: input.createdBy,
+      createdAt: now,
+      updatedAt: now,
     };
+    const payload = { ...files.toRow(local), description: input.description ?? "", file_url: "" };
+    delete payload.restricted;
 
     const result = await offlineSyncService.mutation<StudentRequirementFile>({
       table: "student_requirement_files",
       kind: "create",
       recordId: id,
       payload,
-      fileStorage: {
-        bucket: "student-requirements",
-        path,
-        blob: input.file,
-      },
-      makeLocal: () =>
-        ({
-          id,
-          title: input.title,
-          description: input.description,
-          fileUrl: "",
-          fileName: input.fileName,
-          fileSize: input.file.size,
-          fileType: input.file.type,
-          isPublished: input.isPublished ?? false,
-          restricted: false,
-          createdBy: input.createdBy,
-          createdAt: now,
-          updatedAt: now,
-        }) as StudentRequirementFile,
+      fileStorage: { bucket: REQUIREMENTS_BUCKET, path, blob: input.file },
+      makeLocal: () => local,
       executeOnline: async () => {
-        const { error: uploadError } = await getSupabase()
-          .storage.from("student-requirements")
-          .upload(path, input.file, {
-            upsert: false,
-            contentType: input.file.type,
-          });
-        if (uploadError) throw new Error(uploadError.message);
-        const { data: urlData } = getSupabase()
-          .storage.from("student-requirements")
-          .getPublicUrl(path);
-        const { data: created, error } = await getSupabase()
-          .from("student_requirement_files")
-          .insert({ ...payload, id, file_url: urlData.publicUrl })
-          .select()
-          .single();
-        if (error) throw error;
-        return mapStudentRequirementFile(created);
+        const fileUrl = await uploadRequirement(path, input.file);
+        const row = await unwrap(
+          sb().from("student_requirement_files").insert({ ...payload, id, file_url: fileUrl }).select().single(),
+        );
+        return files.fromRow(row);
       },
     });
-
     if (!result) throw new Error("Failed to create requirement file");
     return result;
   },
 
-  async update(
+  update: (
     id: string,
-    input: {
-      title?: string;
-      description?: string;
-      isPublished?: boolean;
-      restricted?: boolean;
-    },
-  ): Promise<StudentRequirementFile> {
-    const updateData: Record<string, unknown> = {};
-    const localPatch: Partial<StudentRequirementFile> = {};
-    if (input.title !== undefined) {
-      updateData.title = input.title;
-      localPatch.title = input.title;
-    }
-    if (input.description !== undefined) {
-      updateData.description = input.description;
-      localPatch.description = input.description;
-    }
-    if (input.isPublished !== undefined) {
-      updateData.is_published = input.isPublished;
-      localPatch.isPublished = input.isPublished;
-    }
-    if (input.restricted !== undefined) {
-      updateData.restricted = input.restricted;
-      localPatch.restricted = input.restricted;
-    }
+    input: { title?: string; description?: string; isPublished?: boolean; restricted?: boolean },
+  ) => files.update(id, { ...input, updatedAt: new Date().toISOString() }),
+
+  async replaceFile(id: string, file: Blob, fileName: string): Promise<StudentRequirementFile> {
+    const path = storagePath(fileName);
     const updatedAt = new Date().toISOString();
-    updateData.updated_at = updatedAt;
-
-    const result = await offlineSyncService.mutation<StudentRequirementFile>({
-      table: "student_requirement_files",
-      kind: "update",
-      recordId: id,
-      payload: updateData,
-      makeLocal: (current) =>
-        ({
-          ...(current as StudentRequirementFile),
-          ...localPatch,
-          id,
-          updatedAt,
-        }) as StudentRequirementFile,
-      executeOnline: async () => {
-        const { data, error } = await getSupabase()
-          .from("student_requirement_files")
-          .update(updateData)
-          .eq("id", id)
-          .select()
-          .single();
-        if (error) throw error;
-        return mapStudentRequirementFile(data);
-      },
-    });
-
-    if (!result) throw new Error("Failed to update requirement file");
-    return result;
-  },
-
-  async replaceFile(
-    id: string,
-    file: Blob,
-    fileName: string,
-  ): Promise<StudentRequirementFile> {
-    const extension = fileName.split(".").pop()?.toLowerCase() || "pdf";
-    const path = `requirements/${crypto.randomUUID()}.${extension}`;
-    const updatedAt = new Date().toISOString();
-    const payload = {
-      // file_url stamped in during replay / executeOnline, like create().
-      file_url: "",
-      file_name: fileName,
-      file_size: file.size,
-      file_type: file.type,
-      updated_at: updatedAt,
-    };
+    const patch = { fileName, fileSize: file.size, fileType: file.type, updatedAt };
+    const payload = { ...files.toRow(patch), file_url: "" }; // file_url stamped like create()
 
     const result = await offlineSyncService.mutation<StudentRequirementFile>({
       table: "student_requirement_files",
       kind: "update",
       recordId: id,
       payload,
-      fileStorage: {
-        bucket: "student-requirements",
-        path,
-        blob: file,
-      },
-      makeLocal: (current) =>
-        ({
-          ...(current as StudentRequirementFile),
-          id,
-          fileUrl: "",
-          fileName,
-          fileSize: file.size,
-          fileType: file.type,
-          updatedAt,
-        }) as StudentRequirementFile,
+      fileStorage: { bucket: REQUIREMENTS_BUCKET, path, blob: file },
+      makeLocal: (current) => ({ ...(current as StudentRequirementFile), ...patch, id, fileUrl: "" }),
       executeOnline: async () => {
-        const { data: current, error: fetchError } = await getSupabase()
-          .from("student_requirement_files")
-          .select("*")
-          .eq("id", id)
-          .single();
-        if (fetchError) throw fetchError;
-
-        const { error: uploadError } = await getSupabase()
-          .storage.from("student-requirements")
-          .upload(path, file, { upsert: false, contentType: file.type });
-        if (uploadError) throw new Error(uploadError.message);
-        const { data: urlData } = getSupabase()
-          .storage.from("student-requirements")
-          .getPublicUrl(path);
-
-        const oldUrl = (current.file_url as string) ?? "";
-        if (oldUrl.includes("/requirements/")) {
-          try {
-            const oldPath = oldUrl.split("/requirements/")[1];
-            if (oldPath)
-              await getSupabase()
-                .storage.from("student-requirements")
-                .remove([`requirements/${oldPath}`]);
-          } catch (e) {
-            console.warn("Could not remove old requirement file:", e);
-          }
-        }
-
-        const { data: updated, error } = await getSupabase()
-          .from("student_requirement_files")
-          .update({
-            file_url: urlData.publicUrl,
-            file_name: fileName,
-            file_size: file.size,
-            file_type: file.type,
-            updated_at: updatedAt,
-          })
-          .eq("id", id)
-          .select()
-          .single();
-        if (error) throw error;
-        return mapStudentRequirementFile(updated);
+        const current = await unwrap(
+          sb().from("student_requirement_files").select("file_url").eq("id", id).single(),
+        );
+        const fileUrl = await uploadRequirement(path, file);
+        const row = await unwrap(
+          sb()
+            .from("student_requirement_files")
+            .update({ ...payload, file_url: fileUrl })
+            .eq("id", id)
+            .select()
+            .single(),
+        );
+        // Only drop the old object once the row points at the new one.
+        await removeStoredRequirement(current?.file_url);
+        return files.fromRow(row);
       },
     });
-
     if (!result) throw new Error("Failed to replace requirement file");
     return result;
   },
@@ -2220,28 +835,13 @@ export const studentRequirementFilesService = {
       recordId: id,
       payload: {},
       executeOnline: async () => {
-        const { data: current } = await getSupabase()
+        const { data: current } = await sb()
           .from("student_requirement_files")
           .select("file_url")
           .eq("id", id)
-          .single();
-        const { error } = await getSupabase()
-          .from("student_requirement_files")
-          .delete()
-          .eq("id", id);
-        if (error) throw error;
-        const fileUrl = (current?.file_url as string) ?? "";
-        if (fileUrl.includes("/requirements/")) {
-          try {
-            const fileName = fileUrl.split("/requirements/")[1];
-            if (fileName)
-              await getSupabase()
-                .storage.from("student-requirements")
-                .remove([`requirements/${fileName}`]);
-          } catch (e) {
-            console.warn("Could not remove requirement file from storage:", e);
-          }
-        }
+          .maybeSingle();
+        await unwrap(sb().from("student_requirement_files").delete().eq("id", id));
+        await removeStoredRequirement(current?.file_url);
       },
     });
   },
