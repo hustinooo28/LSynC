@@ -10,24 +10,10 @@ type TableName =
   | "payments"
   | "transactions"
   | "feedback"
-  | "board_members"
   | "student_requirement_files";
 type MutationKind = "create" | "update" | "delete";
-
-/**
- * A file that still needs to be pushed to Supabase Storage before its owning
- * DB mutation (a student_requirement_files create/replace) can be replayed.
- * Stored in its own IndexedDB object store (keyed by the owning mutation's
- * `key`) because Blobs are structured-cloneable but would bloat the mutation
- * records and queries otherwise.
- */
-interface PendingUpload {
-  key: string;
-  ownerId: string;
-  bucket: string;
-  path: string;
-  blob: Blob;
-}
+type StoreName = "tables" | "mutations" | "uploads";
+type FileStorage = { bucket: string; path: string; blob: Blob };
 
 interface CachedTable<T = unknown> {
   key: string;
@@ -50,68 +36,44 @@ interface QueuedMutation {
   lastError?: string;
 }
 
-interface OfflineDatabase extends IDBDatabase {
-  transaction(
-    storeNames:
-      | "tables"
-      | "mutations"
-      | "uploads"
-      | Array<"tables" | "mutations" | "uploads">,
-    mode?: IDBTransactionMode,
-  ): IDBTransaction;
+/** A blob to push to Storage before its mutation (keyed by the same `key`) replays. */
+interface PendingUpload extends FileStorage {
+  key: string;
+  ownerId: string;
 }
 
 const DB_NAME = "digital-transparency-board-offline";
 const DB_VERSION = 2;
-const OFFICER_ROLES: readonly UserRole[] = [
-  "admin",
-  "secretary",
-  "treasurer",
-  "auditor",
-  "board-member",
-];
 
 const hasIndexedDb = (): boolean => typeof indexedDB !== "undefined";
-const onlineNow = (): boolean =>
-  typeof navigator === "undefined" || navigator.onLine;
-const cacheKey = (ownerId: string, table: TableName): string =>
-  `${ownerId}:${table}`;
+const onlineNow = (): boolean => typeof navigator === "undefined" || navigator.onLine;
+const cacheKey = (ownerId: string, table: TableName) => `${ownerId}:${table}`;
 
-const request = <T>(value: IDBRequest<T>): Promise<T> =>
+const request = <T>(req: IDBRequest<T>): Promise<T> =>
   new Promise((resolve, reject) => {
-    value.onsuccess = () => resolve(value.result);
-    value.onerror = () =>
-      reject(value.error ?? new Error("IndexedDB request failed"));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error("IndexedDB request failed"));
   });
 
-const transactionDone = (transaction: IDBTransaction): Promise<void> =>
+const transactionDone = (tx: IDBTransaction): Promise<void> =>
   new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onabort = () =>
-      reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
-    transaction.onerror = () =>
-      reject(transaction.error ?? new Error("IndexedDB transaction failed"));
+    tx.oncomplete = () => resolve();
+    tx.onabort = tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed"));
   });
 
-const openDatabase = (): Promise<OfflineDatabase> =>
+const openDatabase = (): Promise<IDBDatabase> =>
   new Promise((resolve, reject) => {
     const open = indexedDB.open(DB_NAME, DB_VERSION);
     open.onupgradeneeded = () => {
-      const database = open.result;
-      if (!database.objectStoreNames.contains("tables"))
-        database.createObjectStore("tables", { keyPath: "key" });
-      if (!database.objectStoreNames.contains("mutations")) {
-        const mutations = database.createObjectStore("mutations", {
-          keyPath: "key",
-        });
-        mutations.createIndex("by_owner_created", ["ownerId", "createdAt"]);
+      const db = open.result;
+      if (!db.objectStoreNames.contains("tables")) db.createObjectStore("tables", { keyPath: "key" });
+      if (!db.objectStoreNames.contains("mutations")) {
+        db.createObjectStore("mutations", { keyPath: "key" }).createIndex("by_owner_created", ["ownerId", "createdAt"]);
       }
-      if (!database.objectStoreNames.contains("uploads"))
-        database.createObjectStore("uploads", { keyPath: "key" });
+      if (!db.objectStoreNames.contains("uploads")) db.createObjectStore("uploads", { keyPath: "key" });
     };
-    open.onsuccess = () => resolve(open.result as OfflineDatabase);
-    open.onerror = () =>
-      reject(open.error ?? new Error("Could not open offline storage"));
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error ?? new Error("Could not open offline storage"));
   });
 
 const errorMessage = (error: unknown): string =>
@@ -125,9 +87,9 @@ const networkFailure = (error: unknown): boolean =>
   /failed to fetch|network(?:error)?|offline|load failed|fetch failed|timeout/i.test(errorMessage(error));
 
 /**
- * Officer-only offline cache and mutation queue.  The server remains the
- * source of truth: local records are used only when connectivity is missing,
- * then operations are replayed in creation order once Supabase is reachable.
+ * Officer-only offline cache and mutation queue. The server stays the source
+ * of truth: cached records are used only without connectivity, and queued
+ * writes replay in creation order once Supabase is reachable.
  */
 class OfflineSyncService {
   private ownerId: string | null = null;
@@ -136,10 +98,18 @@ class OfflineSyncService {
   private listeners = new Set<() => void>();
   private syncInProgress = false;
   private initialized = false;
+  // One shared connection (opening one per call leaked connections).
+  private db: Promise<IDBDatabase> | null = null;
+  // Cache updates are read-modify-write; serialized so concurrent mutations
+  // (e.g. a batched import) can't drop each other's records.
+  private cacheLock: Promise<unknown> = Promise.resolve();
+  // Date.now() alone can tie within a millisecond, letting IndexedDB order a
+  // dependent write (payment) before its parent (contribution) by random key.
+  private lastMutationTimestamp = 0;
 
   configure(userId: string | null, role: UserRole | null): void {
     this.ownerId = userId;
-    this.enabled = Boolean(userId && role && OFFICER_ROLES.includes(role));
+    this.enabled = Boolean(userId && role); // every UserRole is an officer role
     this.state = onlineNow() ? "online" : "offline";
     this.emit();
     if (this.enabled && onlineNow()) void this.sync();
@@ -159,15 +129,11 @@ class OfflineSyncService {
     this.initialized = false;
   }
 
-  private handleOffline = (): void => {
-    this.state = "offline";
-    this.emit();
-  };
+  private handleOffline = (): void => this.setState("offline");
 
   private handleOnline = (): void => {
     if (!this.isEnabled()) return;
-    this.state = "online";
-    this.emit();
+    this.setState("online");
     void this.sync();
   };
 
@@ -192,54 +158,67 @@ class OfflineSyncService {
     this.listeners.forEach((listener) => listener());
   }
 
-  // One shared connection; opening a new one per call leaked connections.
-  private db: Promise<OfflineDatabase> | null = null;
+  private setState(state: SyncState): void {
+    this.state = state;
+    this.emit();
+  }
 
-  private database(): Promise<OfflineDatabase> {
-    if (!hasIndexedDb())
-      return Promise.reject(new Error("Offline storage is not available in this browser."));
+  private database(): Promise<IDBDatabase> {
+    if (!hasIndexedDb()) return Promise.reject(new Error("Offline storage is not available in this browser."));
     if (!this.db) {
-      this.db = openDatabase().then((database) => {
-        database.onclose = () => (this.db = null);
-        database.onversionchange = () => {
-          database.close();
+      const opening = openDatabase().then((db) => {
+        db.onclose = () => (this.db = null);
+        db.onversionchange = () => {
+          db.close();
           this.db = null;
         };
-        return database;
+        return db;
       });
-      this.db.catch(() => (this.db = null));
+      opening.catch(() => (this.db = null));
+      this.db = opening;
     }
     return this.db;
   }
 
-  // Cache writes are read-modify-write; serialize them so concurrent
-  // mutations (e.g. a batched import) can't overwrite each other's records.
-  private cacheLock: Promise<unknown> = Promise.resolve();
+  /** Runs `fn` in one IndexedDB transaction and resolves once it commits. */
+  private async withStores<R>(
+    stores: StoreName | StoreName[],
+    mode: IDBTransactionMode,
+    fn: (tx: IDBTransaction) => Promise<R> | R,
+  ): Promise<R> {
+    const tx = (await this.database()).transaction(stores, mode);
+    const done = transactionDone(tx);
+    try {
+      const result = await fn(tx);
+      await done;
+      return result;
+    } catch (error) {
+      done.catch(() => undefined);
+      throw error;
+    }
+  }
 
   async read<T>(table: TableName): Promise<T[] | null> {
-    if (!this.isEnabled() || !this.ownerId) return null;
-    const database = await this.database();
-    const transaction = database.transaction("tables", "readonly");
-    const entry = (await request(
-      transaction.objectStore("tables").get(cacheKey(this.ownerId, table)),
-    )) as CachedTable<T> | undefined;
-    await transactionDone(transaction);
-    return entry?.records ?? null;
+    const ownerId = this.ownerId;
+    if (!this.isEnabled() || !ownerId) return null;
+    const entry = await this.withStores("tables", "readonly", (tx) =>
+      request(tx.objectStore("tables").get(cacheKey(ownerId, table))),
+    );
+    return (entry as CachedTable<T> | undefined)?.records ?? null;
   }
 
   async cache<T>(table: TableName, records: T[]): Promise<void> {
-    if (!this.isEnabled() || !this.ownerId) return;
-    const database = await this.database();
-    const transaction = database.transaction("tables", "readwrite");
-    const store = transaction.objectStore("tables");
-    store.put({
-      key: cacheKey(this.ownerId, table),
-      ownerId: this.ownerId,
-      table,
-      records,
-      updatedAt: Date.now(),
-    } satisfies CachedTable<T>);
-    await transactionDone(transaction);
+    const ownerId = this.ownerId;
+    if (!this.isEnabled() || !ownerId) return;
+    await this.withStores("tables", "readwrite", (tx) => {
+      tx.objectStore("tables").put({
+        key: cacheKey(ownerId, table),
+        ownerId,
+        table,
+        records,
+        updatedAt: Date.now(),
+      } satisfies CachedTable<T>);
+    });
   }
 
   private mutateCache<T>(
@@ -248,348 +227,193 @@ class OfflineSyncService {
     recordId: string,
     makeLocal?: (current: T | undefined) => T,
   ): Promise<T | undefined> {
-    const run = this.cacheLock.then(() => this.applyToCache(table, kind, recordId, makeLocal));
+    const run = this.cacheLock.then(async () => {
+      if (!this.isEnabled()) return undefined;
+      const records = (await this.read<T>(table)) ?? [];
+      const index = records.findIndex((record) => String((record as { id?: unknown }).id) === recordId);
+      if (kind === "delete") {
+        if (index >= 0) await this.cache(table, records.filter((_, i) => i !== index));
+        return undefined;
+      }
+      const next = makeLocal?.(index >= 0 ? records[index] : undefined);
+      if (!next) return undefined;
+      await this.cache(table, index >= 0 ? records.map((record, i) => (i === index ? next : record)) : [...records, next]);
+      return next;
+    });
     this.cacheLock = run.catch(() => undefined);
     return run;
   }
 
-  private async applyToCache<T>(
-    table: TableName,
-    kind: MutationKind,
-    recordId: string,
-    makeLocal?: (current: T | undefined) => T,
-  ): Promise<T | undefined> {
-    if (!this.isEnabled() || !this.ownerId) return undefined;
-    const current = await this.read<T>(table);
-    const records = current ?? [];
-    const index = records.findIndex(
-      (record) => String((record as { id?: unknown }).id) === recordId,
-    );
-    if (kind === "delete") {
-      if (index >= 0)
-        await this.cache(
-          table,
-          records.filter((_, itemIndex) => itemIndex !== index),
-        );
-      return undefined;
-    }
-    const next = makeLocal?.(index >= 0 ? records[index] : undefined);
-    if (!next) return undefined;
-    const nextRecords =
-      index >= 0
-        ? records.map((record, itemIndex) =>
-            itemIndex === index ? next : record,
-          )
-        : [...records, next];
-    await this.cache(table, nextRecords);
-    return next;
-  }
-
-  // Date.now() alone is only millisecond-resolution. A contribution create
-  // followed immediately by a payment create that references it (the normal
-  // "first payment for this event" flow) can enqueue within the same
-  // millisecond, tying their by_owner_created sort key — at which point
-  // IndexedDB falls back to ordering by the random `key` UUID instead of
-  // insertion order, so the dependent payment can replay *before* the
-  // contribution it points to even exists in the database. Tracking the
-  // last-issued timestamp and never handing out the same value twice
-  // guarantees strict FIFO replay order regardless of clock resolution.
-  private lastMutationTimestamp = 0;
-
-  private nextMutationTimestamp(): number {
-    const now = Date.now();
-    this.lastMutationTimestamp = Math.max(now, this.lastMutationTimestamp + 1);
-    return this.lastMutationTimestamp;
-  }
-
   private async enqueue(
-    mutation: Omit<
-      QueuedMutation,
-      "key" | "ownerId" | "createdAt" | "attempts"
-    >,
-    fileStorage?: { bucket: string; path: string; blob: Blob },
+    mutation: Pick<QueuedMutation, "table" | "kind" | "recordId" | "payload">,
+    fileStorage?: FileStorage,
   ): Promise<void> {
-    if (!this.ownerId) return;
-    const database = await this.database();
-    const storeNames: "mutations" | ("mutations" | "uploads")[] = fileStorage
-      ? ["mutations", "uploads"]
-      : "mutations";
-    const transaction = database.transaction(storeNames, "readwrite");
+    const ownerId = this.ownerId;
+    if (!ownerId) return;
     const key = crypto.randomUUID();
-    transaction.objectStore("mutations").put({
-      ...mutation,
-      key,
-      ownerId: this.ownerId,
-      createdAt: this.nextMutationTimestamp(),
-      attempts: 0,
-    } satisfies QueuedMutation);
-    if (fileStorage) {
-      transaction.objectStore("uploads").put({
+    this.lastMutationTimestamp = Math.max(Date.now(), this.lastMutationTimestamp + 1);
+    const createdAt = this.lastMutationTimestamp;
+    await this.withStores(fileStorage ? ["mutations", "uploads"] : "mutations", "readwrite", (tx) => {
+      tx.objectStore("mutations").put({
+        ...mutation,
+        id: crypto.randomUUID(),
         key,
-        ownerId: this.ownerId,
-        bucket: fileStorage.bucket,
-        path: fileStorage.path,
-        blob: fileStorage.blob,
-      } satisfies PendingUpload);
-    }
-    await transactionDone(transaction);
+        ownerId,
+        createdAt,
+        attempts: 0,
+      } satisfies QueuedMutation);
+      if (fileStorage) tx.objectStore("uploads").put({ ...fileStorage, key, ownerId } satisfies PendingUpload);
+    });
   }
 
+  /**
+   * Runs `executeOnline` when possible and mirrors the result into the cache;
+   * otherwise (offline, a network failure, or a sync in progress) applies
+   * `makeLocal` to the cache and queues the write for replay.
+   */
   async mutation<T>(params: {
     table: TableName;
     kind: MutationKind;
     recordId: string;
     payload: Record<string, unknown>;
-    fileStorage?: { bucket: string; path: string; blob: Blob };
+    fileStorage?: FileStorage;
     makeLocal?: (current: T | undefined) => T;
     executeOnline: () => Promise<T>;
   }): Promise<T | undefined> {
+    const { table, kind, recordId, payload } = params;
+    // Writes made while a replay runs queue behind it, so they can't reach
+    // Supabase before the queued writes they may depend on.
     const duringSync = this.syncInProgress;
+
     const queueOffline = async (): Promise<T | undefined> => {
-      const local = await this.mutateCache<T>(
-        params.table,
-        params.kind,
-        params.recordId,
-        params.makeLocal,
-      );
-      await this.enqueue(
-        {
-          id: crypto.randomUUID(),
-          table: params.table,
-          kind: params.kind,
-          recordId: params.recordId,
-          payload: params.payload,
-        },
-        params.fileStorage,
-      );
-      if (duringSync) {
-        // The running sync may already have drained the queue; make sure
-        // this write still gets sent.
-        if (!this.syncInProgress) void this.sync();
-      } else {
-        this.state = "offline";
-        this.emit();
-      }
+      const local = await this.mutateCache<T>(table, kind, recordId, params.makeLocal);
+      await this.enqueue({ table, kind, recordId, payload }, params.fileStorage);
+      if (!duringSync) this.setState("offline");
+      // The running sync may have drained the queue already; make sure this goes out.
+      else if (!this.syncInProgress) void this.sync();
       return local;
     };
 
     if (!this.isEnabled()) return params.executeOnline();
-    // While a replay is running, queue behind it so a new write can't reach
-    // Supabase before the queued writes it may depend on.
     if (this.isOffline() || duringSync) return queueOffline();
     try {
       const result = await params.executeOnline();
-      await this.mutateCache<T>(
-        params.table,
-        params.kind,
-        params.recordId,
-        () => result,
-      );
+      await this.mutateCache<T>(table, kind, recordId, () => result);
       return result;
     } catch (error) {
       if (!networkFailure(error)) throw error;
-      // navigator.onLine can remain true while a network request is failing
-      // (for example, when Wi-Fi is connected but has no internet access).
-      // Treat that condition as offline immediately so the mutation is queued
-      // and the UI remains usable instead of waiting on repeated requests.
-      this.state = "offline";
-      this.emit();
+      // navigator.onLine can stay true on a connection with no internet.
       return queueOffline();
     }
   }
 
   private async queuedMutations(): Promise<QueuedMutation[]> {
-    if (!this.ownerId) return [];
-    const database = await this.database();
-    const transaction = database.transaction("mutations", "readonly");
-    const index = transaction
-      .objectStore("mutations")
-      .index("by_owner_created");
-    const entries = await request(
-      index.getAll(
-        IDBKeyRange.bound(
-          [this.ownerId, 0],
-          [this.ownerId, Number.MAX_SAFE_INTEGER],
-        ),
+    const ownerId = this.ownerId;
+    if (!ownerId) return [];
+    return this.withStores("mutations", "readonly", (tx) =>
+      request(
+        tx
+          .objectStore("mutations")
+          .index("by_owner_created")
+          .getAll(IDBKeyRange.bound([ownerId, 0], [ownerId, Number.MAX_SAFE_INTEGER])),
       ),
-    );
-    await transactionDone(transaction);
-    return entries as QueuedMutation[];
+    ) as Promise<QueuedMutation[]>;
   }
 
-  private async removeMutation(key: string): Promise<void> {
-    const database = await this.database();
-    const transaction = database.transaction("mutations", "readwrite");
-    transaction.objectStore("mutations").delete(key);
-    await transactionDone(transaction);
+  private deleteKey(store: "mutations" | "uploads", key: string): Promise<void> {
+    return this.withStores(store, "readwrite", (tx) => void tx.objectStore(store).delete(key));
   }
 
-  /** Number of local changes that have not yet reached Supabase — queued
-   *  because we were offline, or stuck after a failed replay. */
+  /** Writes not yet on Supabase (queued offline or stuck after a failed replay). */
   async pendingCount(): Promise<number> {
     return (await this.queuedMutations()).length;
   }
 
   /**
-   * The change that is currently blocking sync, if any. Mutations replay in
-   * strict creation order (so a create is never applied after its own
-   * update), which means a single bad mutation stalls every mutation queued
-   * behind it. Surfacing *this specific one* — table + the real Postgres/
-   * PostgREST error — is what actually tells you why nothing is reaching
-   * the database, instead of a generic "sync failed".
+   * The oldest queued write and its error, if it failed. Replay is strictly
+   * ordered, so this one write blocks everything queued behind it.
    */
   async firstFailure(): Promise<{ table: TableName; message: string } | null> {
     const [next] = await this.queuedMutations();
-    if (!next?.lastError) return null;
-    return { table: next.table, message: next.lastError };
+    return next?.lastError ? { table: next.table, message: next.lastError } : null;
   }
 
-  /**
-   * Permanently drops the oldest queued mutation without sending it to
-   * Supabase. Use only when a change can never succeed (e.g. it was created
-   * against a schema that has since changed) and is blocking every
-   * mutation queued after it. This does not touch the database — the
-   * change is simply forgotten on this device.
-   */
+  /** Forgets the oldest queued write on this device (for writes that can never succeed). */
   async discardOldest(): Promise<void> {
     const [next] = await this.queuedMutations();
     if (!next) return;
-    await this.removeMutation(next.key);
-    // Drop any pending Storage blob parked for this mutation so it isn't
-    // orphaned now that the owning DB change is being forgotten.
-    await this.removeUpload(next.key);
+    await this.deleteKey("mutations", next.key);
+    await this.deleteKey("uploads", next.key);
   }
 
-  private async recordFailure(
-    mutation: QueuedMutation,
-    error: unknown,
-  ): Promise<void> {
-    const database = await this.database();
-    const transaction = database.transaction("mutations", "readwrite");
-    transaction.objectStore("mutations").put({
-      ...mutation,
-      attempts: mutation.attempts + 1,
-      lastError: errorMessage(error),
+  /** Merges `patch` into a queued mutation (e.g. failure info or a file URL). */
+  private patchMutation(key: string, patch: (current: QueuedMutation) => Partial<QueuedMutation>): Promise<void> {
+    return this.withStores("mutations", "readwrite", async (tx) => {
+      const store = tx.objectStore("mutations");
+      const current = (await request(store.get(key))) as QueuedMutation | undefined;
+      if (current) store.put({ ...current, ...patch(current) });
     });
-    await transactionDone(transaction);
-  }
-
-  /**
-   * Persists an in-flight `payload` back to the queued mutation record. Used
-   * after a pending Storage upload succeeds so a later DB write failure (or
-   * dropped response) doesn't replay the row without the file URL.
-   */
-  private async savePayload(
-    key: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> {
-    const database = await this.database();
-    const transaction = database.transaction("mutations", "readwrite");
-    const store = transaction.objectStore("mutations");
-    const current = (await request(store.get(key))) as
-      | QueuedMutation
-      | undefined;
-    if (current) {
-      store.put({
-        ...current,
-        payload: { ...current.payload, ...payload },
-      });
-    }
-    await transactionDone(transaction);
-  }
-
-  private async pendingUpload(key: string): Promise<PendingUpload | null> {
-    if (!this.ownerId) return null;
-    const database = await this.database();
-    const transaction = database.transaction("uploads", "readonly");
-    const entry = (await request(
-      transaction.objectStore("uploads").get(key),
-    )) as PendingUpload | undefined;
-    await transactionDone(transaction);
-    return entry ?? null;
-  }
-
-  private async removeUpload(key: string): Promise<void> {
-    const database = await this.database();
-    const transaction = database.transaction("uploads", "readwrite");
-    transaction.objectStore("uploads").delete(key);
-    await transactionDone(transaction);
   }
 
   private async replay(mutation: QueuedMutation): Promise<void> {
-    // student_requirement_files rows point at a file in Supabase Storage. When
-    // the create/replace was queued offline the blob was parked in the uploads
-    // store; push it to Storage first and stamp the resulting public URL into
-    // the payload so the DB insert/update below references a live file.
-    const upload = await this.pendingUpload(mutation.key);
+    // A requirement-file write queued offline parked its blob in "uploads":
+    // upload it first and stamp the public URL into the payload.
+    const upload = (await this.withStores("uploads", "readonly", (tx) =>
+      request(tx.objectStore("uploads").get(mutation.key)),
+    )) as PendingUpload | undefined;
     if (upload && !mutation.payload.file_url) {
-      const { error: uploadError } = await getSupabase()
-        .storage.from(upload.bucket)
-        .upload(upload.path, upload.blob, {
-          upsert: false,
-          contentType: upload.blob.type,
-        });
-      if (uploadError) throw new Error(uploadError.message);
-      const { data } = getSupabase()
-        .storage.from(upload.bucket)
-        .getPublicUrl(upload.path);
-      mutation.payload.file_url = data.publicUrl;
-      // Persist the public URL so an interrupted sync (upload succeeded, DB
-      // write failed) doesn't replay the row without a file reference.
-      await this.savePayload(mutation.key, { file_url: data.publicUrl });
-      // The blob reached Storage; drop it so a retry skips the upload.
-      await this.removeUpload(mutation.key);
+      const storage = getSupabase().storage.from(upload.bucket);
+      const { error } = await storage.upload(upload.path, upload.blob, {
+        upsert: false,
+        contentType: upload.blob.type,
+      });
+      if (error) throw new Error(error.message);
+      mutation.payload.file_url = storage.getPublicUrl(upload.path).data.publicUrl;
+      // Persist the URL so a retry after a failed DB write skips the upload.
+      await this.patchMutation(mutation.key, (current) => ({
+        payload: { ...current.payload, file_url: mutation.payload.file_url },
+      }));
+      await this.deleteKey("uploads", mutation.key);
     }
 
     const query = getSupabase().from(mutation.table);
-    let error: { message?: string } | null = null;
-    if (mutation.kind === "create") {
-      // Client-created ids are primary keys. Upsert makes an interrupted replay
-      // idempotent: if Supabase accepted a prior request but the response was
-      // lost, this retry updates that exact same row instead of creating a copy.
-      ({ error } = await query.upsert(
-        { id: mutation.recordId, ...mutation.payload },
-        { onConflict: "id" },
-      ));
-    } else if (mutation.kind === "update") {
-      ({ error } = await query
-        .update(mutation.payload)
-        .eq("id", mutation.recordId));
-    } else {
-      ({ error } = await query.delete().eq("id", mutation.recordId));
-    }
-    if (error)
-      throw new Error(error.message ?? "Supabase synchronization failed");
+    const { error } =
+      mutation.kind === "create"
+        ? // Upsert on the client-generated id keeps a retried create idempotent.
+          await query.upsert({ id: mutation.recordId, ...mutation.payload }, { onConflict: "id" })
+        : mutation.kind === "update"
+          ? await query.update(mutation.payload).eq("id", mutation.recordId)
+          : await query.delete().eq("id", mutation.recordId);
+    if (error) throw new Error(error.message ?? "Supabase synchronization failed");
   }
 
   async sync(): Promise<void> {
     if (!this.isEnabled() || !onlineNow() || this.syncInProgress) return;
     this.syncInProgress = true;
-    this.state = "syncing";
-    this.emit();
+    this.setState("syncing");
     try {
       // Re-read the queue each pass: writes made during sync are appended to it.
       for (let mutation; (mutation = (await this.queuedMutations())[0]); ) {
         try {
           await this.replay(mutation);
-          await this.removeMutation(mutation.key);
+          await this.deleteKey("mutations", mutation.key);
         } catch (error) {
-          await this.recordFailure(mutation, error);
-          this.state = networkFailure(error) ? "offline" : "failed";
-          this.emit();
-          return;
+          const lastError = errorMessage(error);
+          await this.patchMutation(mutation.key, (current) => ({ attempts: current.attempts + 1, lastError }));
+          throw error;
         }
       }
-      this.state = "synced";
-      this.emit();
+      this.setState("synced");
     } catch (error) {
-      this.state = networkFailure(error) ? "offline" : "failed";
-      this.emit();
+      this.setState(networkFailure(error) ? "offline" : "failed");
     } finally {
       this.syncInProgress = false;
     }
     // Catch writes queued while the last pass was finishing.
-    if (this.state === "synced" && (await this.pendingCount()) > 0) void this.sync();
+    if (this.state === "synced") {
+      const pending = await this.pendingCount().catch(() => 0);
+      if (pending > 0) void this.sync();
+    }
   }
 }
 

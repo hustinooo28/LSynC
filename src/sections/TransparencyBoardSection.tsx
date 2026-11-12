@@ -196,45 +196,6 @@ export default function TransparencyBoardSection({ adminMode = false, onBack, on
         <LoadingCard rows={6} label="Loading financial data…" />
       ) : (
         <>
-          <section>
-            <SectionHeading eyebrow="Allocations" title="Where each event's money stands" />
-            {allocations.length === 0 ? (
-              <div className="card">
-                <EmptyState icon={PieChart} title="No event allocations yet" />
-              </div>
-            ) : (
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {allocations.map((a) => {
-                  const used = pct(a.totalSpent, a.totalCollected);
-                  return (
-                    <article key={a.eventId} className="card card-hover p-5">
-                      <div className="flex items-start justify-between gap-3">
-                        <h3 className="min-w-0 truncate font-bold text-ink" title={a.eventName}>{a.eventName}</h3>
-                        <span className="chip chip-brand shrink-0">{formatPeso(a.allocationAmount)} / student</span>
-                      </div>
-                      <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-                        {[
-                          ["Collected", a.totalCollected, "text-success"],
-                          ["Spent", a.totalSpent, "text-danger"],
-                          ["Balance", a.remainingBalance, "text-ink"],
-                        ].map(([label, value, tone]) => (
-                          <div key={label} className="rounded-xl bg-surface-2 px-2 py-2.5">
-                            <p className="text-[11px] font-medium text-muted">{label}</p>
-                            <p className={`mt-0.5 truncate text-sm font-bold ${tone}`}>{formatPeso(value as number)}</p>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-4 h-2 overflow-hidden rounded-full bg-surface-2">
-                        <div className="h-full rounded-full bg-gradient-to-r from-brand-500 to-indigo-500" style={{ width: `${used}%` }} />
-                      </div>
-                      <p className="mt-1.5 text-xs text-muted">{used}% of collected funds spent</p>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-
           <section className="card overflow-hidden">
             <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-3">
@@ -315,6 +276,45 @@ export default function TransparencyBoardSection({ adminMode = false, onBack, on
                 </div>
                 <Pagination {...pagination} />
               </>
+            )}
+          </section>
+
+          <section>
+            <SectionHeading eyebrow="Allocations" title="Where each event's money stands" />
+            {allocations.length === 0 ? (
+              <div className="card">
+                <EmptyState icon={PieChart} title="No event allocations yet" />
+              </div>
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {allocations.map((a) => {
+                  const used = pct(a.totalSpent, a.totalCollected);
+                  return (
+                    <article key={a.eventId} className="card card-hover p-5">
+                      <div className="flex items-start justify-between gap-3">
+                        <h3 className="min-w-0 truncate font-bold text-ink" title={a.eventName}>{a.eventName}</h3>
+                        <span className="chip chip-brand shrink-0">{formatPeso(a.allocationAmount)} / student</span>
+                      </div>
+                      <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+                        {[
+                          ["Collected", a.totalCollected, "text-success"],
+                          ["Spent", a.totalSpent, "text-danger"],
+                          ["Balance", a.remainingBalance, "text-ink"],
+                        ].map(([label, value, tone]) => (
+                          <div key={label} className="rounded-xl bg-surface-2 px-2 py-2.5">
+                            <p className="text-[11px] font-medium text-muted">{label}</p>
+                            <p className={`mt-0.5 truncate text-sm font-bold ${tone}`}>{formatPeso(value as number)}</p>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4 h-2 overflow-hidden rounded-full bg-surface-2">
+                        <div className="h-full rounded-full bg-gradient-to-r from-brand-500 to-indigo-500" style={{ width: `${used}%` }} />
+                      </div>
+                      <p className="mt-1.5 text-xs text-muted">{used}% of collected funds spent</p>
+                    </article>
+                  );
+                })}
+              </div>
             )}
           </section>
 

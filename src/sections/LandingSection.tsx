@@ -145,7 +145,7 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
                 className="w-full bg-transparent text-sm font-medium text-ink outline-none placeholder:text-muted/70"
               />
             </Segment>
-            <button type="submit" disabled={searching || !name.trim() || !studentId.trim()} className="btn btn-primary btn-lg mt-1 sm:mt-0">
+            <button type="submit" disabled={searching} className="btn btn-primary btn-lg mt-1 sm:mt-0">
               {searching ? "Checking…" : "View My Record"}
               <span className="btn-orb">{searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}</span>
             </button>
