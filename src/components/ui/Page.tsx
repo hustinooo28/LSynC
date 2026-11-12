@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
+import SplitText from "@/components/motion/SplitText";
 
 interface PageProps {
   title: ReactNode;
@@ -21,7 +22,7 @@ interface PageProps {
 export default function Page({ title, subtitle, eyebrow, onBack, actions, hero, children }: PageProps) {
   return (
     <div className="min-h-screen pb-16">
-      <header className="hero-bg pb-24 pt-24 lg:pt-28">
+      <header className="hero-bg blend-bottom pb-40 pt-24 lg:pt-28">
         <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 sm:px-6 lg:flex-row lg:items-end lg:justify-between lg:px-8">
           <div className="flex items-start gap-4">
             {onBack && (
@@ -31,7 +32,7 @@ export default function Page({ title, subtitle, eyebrow, onBack, actions, hero, 
             )}
             <div className="animate-fade-up">
               {eyebrow && <span className="eyebrow mb-3">{eyebrow}</span>}
-              <h1 className="text-3xl font-extrabold text-white lg:text-4xl">{title}</h1>
+              <SplitText className="text-3xl font-extrabold text-white lg:text-4xl">{title}</SplitText>
               {subtitle && <p className="mt-2 max-w-2xl text-sm text-white/70 lg:text-base">{subtitle}</p>}
             </div>
           </div>
@@ -39,7 +40,7 @@ export default function Page({ title, subtitle, eyebrow, onBack, actions, hero, 
         </div>
         {hero && <div className="mx-auto mt-8 max-w-7xl px-4 sm:px-6 lg:px-8">{hero}</div>}
       </header>
-      <div className="relative mx-auto -mt-14 max-w-7xl animate-fade-up space-y-6 px-4 sm:px-6 lg:px-8">{children}</div>
+      <div className="stagger relative mx-auto -mt-24 max-w-7xl space-y-6 px-4 sm:px-6 lg:px-8">{children}</div>
     </div>
   );
 }

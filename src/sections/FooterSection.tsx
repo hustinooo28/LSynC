@@ -31,7 +31,7 @@ const Heading = ({ children }: { children: string }) => <h4 className="mb-4 text
 
 export default function FooterSection({ onNavigate }: FooterSectionProps) {
   return (
-    <footer className="bg-brand-950 px-4 pb-8 pt-14 text-sm text-white/60 sm:px-6">
+    <footer className="blend-top bg-brand-950 px-4 pb-8 pt-32 text-sm text-white/60 sm:px-6">
       <div className="mx-auto grid max-w-6xl gap-10 sm:grid-cols-2 lg:grid-cols-[1.4fr_1fr_1.2fr_1.2fr]">
         <div>
           <div className="flex items-center gap-2.5">

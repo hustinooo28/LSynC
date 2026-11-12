@@ -33,3 +33,19 @@ text on surfaces — use the tokens below.
 ## Hooks
 - `useSearch(items, textFn, filterAccessors)` → `{ query, setQuery, filters, setFilter, reset, filtered }`
 - `usePagination(items, pageSize)` → `{ pageItems, pagination }` (spread `pagination` into `<Pagination />`)
+
+## Motion & blending
+Built on GSAP (`@/lib/gsap` registers ScrollTrigger, SplitText, useGSAP), Lenis
+smooth scrolling and React Bits-style components. All JS motion is skipped when
+the OS asks for reduced motion; CSS motion is neutralised by a global rule.
+- Global (automatic): every button/link/tab eases state changes and scales on
+  press; arrows nudge on hover; `.btn` ripples on click; `.btn-primary` /
+  `.btn-light` are magnetic; `.card-hover`, `.card-brand`, `.glass` get a
+  cursor spotlight (`useInteractionMotion`, mounted once in App); views
+  cross-fade (`.page-enter`); theme switches cross-fade (View Transitions).
+- `.blend-bottom` / `.blend-top` fade full-width bands into the page — no hard
+  edges. `Page` uses `.blend-bottom` and staggers its children (`.stagger`).
+- Components (`@/components/motion/*`): `SplitText` (masked word/char rise),
+  `CountUp` (numbers in `StatCard`), `Reveal` (ScrollTrigger fade/rise; `stagger`
+  for children), `SmoothScroll` (Lenis ↔ GSAP ticker). Scrollable areas inside
+  modals need `data-lenis-prevent`.

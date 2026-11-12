@@ -10,6 +10,9 @@ import { ROLE_LABEL, canAccess } from "@/lib/roles";
 import { LoadingCard } from "@/components/ui/Skeleton";
 import SyncStatusBadge from "@/components/SyncStatusBadge";
 import PushPromptModal from "@/components/PushPromptModal";
+import SmoothScroll from "@/components/motion/SmoothScroll";
+import { scrollToTop } from "@/lib/scroll";
+import { useInteractionMotion } from "@/hooks/useInteractionMotion";
 import Navigation from "@/sections/Navigation";
 import LandingSection from "@/sections/LandingSection";
 import FooterSection from "@/sections/FooterSection";
@@ -45,6 +48,7 @@ function App() {
   const [authReady, setAuthReady] = useState(false);
   const [searching, setSearching] = useState(false);
   const role: UserRole | null = auth?.role ?? null;
+  useInteractionMotion();
 
   useEffect(() => {
     offlineSyncService.start();
@@ -73,7 +77,7 @@ function App() {
 
   const navigate = (next: ViewState) => {
     setView(next);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    scrollToTop();
   };
 
   const handleSearch = async (name: string, studentId: string) => {
@@ -195,11 +199,14 @@ function App() {
   return (
     <div className="min-h-screen">
       <Toaster position="top-center" richColors />
+      <SmoothScroll />
       <SyncStatusBadge />
       <Navigation currentView={view} onNavigate={navigate} role={role} onLogout={handleLogout} studentId={student?.id} />
       <PushPromptModal isLoggedIn={!!role} studentId={student?.id} />
       <main>
-        <Suspense fallback={<Fallback />}>{renderView()}</Suspense>
+        <Suspense fallback={<Fallback />}>
+          <div key={view} className="page-enter">{renderView()}</div>
+        </Suspense>
       </main>
       {view === "landing" && <FooterSection onNavigate={navigate} />}
     </div>

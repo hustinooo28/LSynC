@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import CountUp from "@/components/motion/CountUp";
 
 const TONES = {
   brand: "bg-brand-500/10 text-brand-500",
@@ -29,7 +30,9 @@ export default function StatCard({ label, value, icon: Icon, tone = "brand", hin
       )}
       <div className="min-w-0">
         <p className={cn("text-xs font-semibold", featured ? "text-white/75" : "text-muted")}>{label}</p>
-        <p className={cn("mt-1 truncate text-2xl font-extrabold tracking-tight", featured ? "text-white" : "text-ink")}>{value}</p>
+        <p className={cn("mt-1 truncate text-2xl font-extrabold tabular-nums tracking-tight", featured ? "text-white" : "text-ink")}>
+          <CountUp value={value} />
+        </p>
         {hint && <p className={cn("mt-0.5 truncate text-xs", featured ? "text-white/70" : "text-muted")}>{hint}</p>}
       </div>
     </div>

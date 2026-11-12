@@ -43,8 +43,8 @@ module.exports = {
       },
       keyframes: {
         "fade-up": {
-          from: { opacity: "0", transform: "translateY(12px)" },
-          to: { opacity: "1", transform: "translateY(0)" },
+          from: { opacity: "0", translate: "0 12px" },
+          to: { opacity: "1", translate: "none" },
         },
         float: {
           "0%,100%": { transform: "translateY(0)" },

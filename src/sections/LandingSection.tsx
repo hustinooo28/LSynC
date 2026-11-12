@@ -4,6 +4,9 @@ import type { Student } from "@/types";
 import { studentsService } from "@/services/db";
 import { cn } from "@/lib/utils";
 import LSCOfficerCarousel from "@/components/LSCOfficerCarousel";
+import SplitText from "@/components/motion/SplitText";
+import Reveal from "@/components/motion/Reveal";
+import { gsap, useGSAP, prefersReducedMotion } from "@/lib/gsap";
 
 interface LandingSectionProps {
   onSearch: (name: string, studentId: string) => void;
@@ -19,6 +22,19 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
   const [open, setOpen] = useState(false);
   const picked = useRef(""); // name chosen from the list — don't search it again
   const nameRef = useRef<HTMLInputElement>(null);
+  const heroRef = useRef<HTMLElement>(null);
+
+  // Hero choreography: intro elements rise after the headline, preview cards
+  // fly in, then drift upward (parallax) as the hero scrolls away.
+  useGSAP(
+    () => {
+      if (prefersReducedMotion()) return;
+      gsap.from(".hero-intro", { y: 28, opacity: 0, filter: "blur(6px)", stagger: 0.1, delay: 0.45, clearProps: "filter,transform" });
+      gsap.from(".hero-card", { y: 140, opacity: 0, rotate: 0, stagger: 0.12, delay: 0.7, duration: 1.3, ease: "expo.out" });
+      gsap.to(".hero-cards", { yPercent: -30, ease: "none", scrollTrigger: { trigger: heroRef.current, start: "top top", end: "bottom top", scrub: true } });
+    },
+    { scope: heroRef },
+  );
 
   // Debounced name autocomplete; `stale` drops responses for older keystrokes.
   useEffect(() => {
@@ -75,23 +91,23 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
 
   return (
     <>
-      <section className="hero-bg flex min-h-[100svh] flex-col items-center px-4 pt-32 sm:px-6 lg:pt-40">
-        <div className="mx-auto w-full max-w-4xl animate-fade-up text-center">
-          <span className="eyebrow">
+      <section ref={heroRef} className="hero-bg blend-bottom flex min-h-[100svh] flex-col items-center px-4 pt-32 sm:px-6 lg:pt-40">
+        <div className="mx-auto w-full max-w-4xl text-center">
+          <span className="hero-intro eyebrow">
             <ShieldCheck className="h-3.5 w-3.5 text-powder" />
             LSC Student Digital Board · Transparency you can check
           </span>
-          <h1 className="mt-6 text-[2.5rem] font-extrabold leading-[1.05] text-white sm:text-6xl lg:text-7xl">
+          <SplitText by="chars" delay={0.1} className="mt-6 text-[2.5rem] font-extrabold leading-[1.05] text-white sm:text-6xl lg:text-7xl">
             Your Council Records,
             <br />
             Clear &amp; <span className="text-brand-400">Transparent</span>
-          </h1>
-          <p className="mx-auto mt-5 max-w-xl text-base text-white/65 sm:text-lg">
+          </SplitText>
+          <p className="hero-intro mx-auto mt-5 max-w-xl text-base text-white/65 sm:text-lg">
             Check your contributions and attendance, and see exactly how student funds are used — all in one place.
           </p>
 
           {/* Student lookup */}
-          <form onSubmit={submit} className="card mx-auto mt-10 grid max-w-3xl gap-1 p-2 text-left shadow-lift sm:grid-cols-[1fr_1fr_auto] sm:items-center sm:rounded-full">
+          <form onSubmit={submit} className="hero-intro card mx-auto mt-10 grid max-w-3xl gap-1 p-2 text-left shadow-lift sm:grid-cols-[1fr_1fr_auto] sm:items-center sm:rounded-full">
             <div className="relative">
               <Segment id="lookup-name" label="Student name">
                 <input
@@ -160,7 +176,7 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
         </div>
 
         {/* Decorative preview cards */}
-        <div aria-hidden className="pointer-events-none mt-auto hidden w-full max-w-5xl translate-y-10 grid-cols-3 items-end gap-6 pt-16 md:grid">
+        <div aria-hidden className="hero-cards pointer-events-none -mb-10 mt-auto hidden w-full max-w-5xl grid-cols-3 items-end gap-6 pt-16 md:grid">
           <Floating tilt="-rotate-6" delay="">
             <div className="glass p-5">
               <p className="text-xs font-semibold text-white/60">Funds Collected</p>
@@ -201,19 +217,19 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
       {/* Features */}
       <section className="bg-page px-4 py-20 sm:px-6 lg:py-28">
         <div className="mx-auto max-w-6xl">
-          <div className="mx-auto max-w-2xl text-center">
+          <Reveal className="mx-auto max-w-2xl text-center">
             <span className="eyebrow">
               <FileCheck2 className="h-3.5 w-3.5" /> Why LSynC
             </span>
             <h2 className="mt-4 text-3xl font-extrabold sm:text-5xl">Everything about your council, in one honest place</h2>
             <p className="mt-4 text-muted">Built so every student can check the numbers — no requests, no waiting.</p>
-          </div>
-          <div className="mt-14 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+          </Reveal>
+          <Reveal stagger className="mt-14 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
             {features.map(({ icon: Icon, title, text, action }, i) => (
               <button
                 key={title}
                 onClick={action}
-                className={cn("group flex flex-col p-6 text-left transition hover:-translate-y-1", i === 0 ? "card-brand" : "card hover:shadow-lift")}
+                className={cn("group flex flex-col p-6 text-left", i === 0 ? "card-brand card-hover" : "card card-hover")}
               >
                 <span className={cn("icon-tile", i === 0 && "border-white/25 bg-white/10 text-white")}>
                   <Icon className="h-5 w-5" />
@@ -221,24 +237,24 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
                 <h3 className={cn("mt-8 text-lg font-bold", i === 0 && "text-white")}>{title}</h3>
                 <p className={cn("mt-2 flex-1 text-sm", i === 0 ? "text-white/75" : "text-muted")}>{text}</p>
                 <span className={cn("mt-6 inline-flex items-center gap-1.5 text-sm font-semibold", i === 0 ? "text-white" : "text-brand-600")}>
-                  Learn more <ArrowRight className="h-4 w-4 transition group-hover:translate-x-1" />
+                  Learn more <ArrowRight className="h-4 w-4" />
                 </span>
               </button>
             ))}
-          </div>
+          </Reveal>
         </div>
       </section>
 
       {/* Council officers */}
       <section className="bg-page px-4 pb-20 sm:px-6 lg:pb-28">
-        <div className="hero-bg mx-auto max-w-6xl rounded-4xl px-4 py-14 sm:px-8">
+        <Reveal className="hero-bg mx-auto max-w-6xl rounded-4xl px-4 py-14 sm:px-8">
           <div className="mb-10 text-center">
             <span className="eyebrow">Leadership · Service · Commitment</span>
             <h2 className="mt-4 text-3xl font-extrabold text-white sm:text-4xl">Meet your council</h2>
             <p className="mx-auto mt-3 max-w-xl text-white/65">The officers serving the Local Student Council community.</p>
           </div>
           <LSCOfficerCarousel />
-        </div>
+        </Reveal>
       </section>
     </>
   );
@@ -258,7 +274,7 @@ function Segment({ id, label, divided, children }: { id: string; label: string; 
 /** Rotation lives on the wrapper because `animate-float` owns the transform. */
 function Floating({ tilt, delay, children }: { tilt: string; delay: string; children: ReactNode }) {
   return (
-    <div className={tilt}>
+    <div className={cn("hero-card", tilt)}>
       <div className={cn("animate-float", delay)}>{children}</div>
     </div>
   );
