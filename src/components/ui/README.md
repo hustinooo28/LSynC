@@ -49,3 +49,10 @@ the OS asks for reduced motion; CSS motion is neutralised by a global rule.
   `CountUp` (numbers in `StatCard`), `Reveal` (ScrollTrigger fade/rise; `stagger`
   for children), `SmoothScroll` (Lenis ↔ GSAP ticker). Scrollable areas inside
   modals need `data-lenis-prevent`.
+- Grow-from-origin: whatever the user presses is remembered (`lib/transition.ts`).
+  View changes (`navigate` in App) grow the new page out of it via the View
+  Transitions API (`growFrom`), after preloading that page's code; the theme
+  switch spreads as a circle from the toggle; every `Modal` morphs out of the
+  pressed element and flows back into it on close.
+- Long tables: wrap in `<div data-lenis-prevent className="table-scroll">` — the
+  table scrolls inside its card with a pinned header instead of the page.

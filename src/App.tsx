@@ -12,6 +12,7 @@ import SyncStatusBadge from "@/components/SyncStatusBadge";
 import PushPromptModal from "@/components/PushPromptModal";
 import SmoothScroll from "@/components/motion/SmoothScroll";
 import { scrollToTop } from "@/lib/scroll";
+import { growFrom } from "@/lib/transition";
 import { useInteractionMotion } from "@/hooks/useInteractionMotion";
 import Navigation from "@/sections/Navigation";
 import LandingSection from "@/sections/LandingSection";
@@ -19,20 +20,59 @@ import FooterSection from "@/sections/FooterSection";
 
 // Public pages other than the landing page, and every staff page, are
 // code-split so first-time visitors only download the landing bundle.
-const StudentRecordSection = lazy(() => import("@/sections/StudentRecordSection"));
-const TransparencyBoardSection = lazy(() => import("@/sections/TransparencyBoardSection"));
-const FeedbackSection = lazy(() => import("@/sections/FeedbackSection"));
-const AdminLoginSection = lazy(() => import("@/sections/AdminLoginSection"));
-const ForgotPasswordSection = lazy(() => import("@/sections/ForgotPasswordSection"));
-const ResetPasswordSection = lazy(() => import("@/sections/ResetPasswordSection"));
-const AdminDashboardSection = lazy(() => import("@/sections/AdminDashboardSection"));
-const StudentManagementSection = lazy(() => import("@/sections/StudentManagementSection"));
-const RequirementFilesManagementSection = lazy(() => import("@/sections/RequirementFilesManagementSection"));
-const EventManagementSection = lazy(() => import("@/sections/EventManagementSection"));
-const ContributionManagementSection = lazy(() => import("@/sections/ContributionManagementSection"));
-const FeedbackManagementSection = lazy(() => import("@/sections/FeedbackManagementSection"));
-const ReportManagementSection = lazy(() => import("@/sections/ReportManagementSection"));
-const AttendanceManagementSection = lazy(() => import("@/sections/AttendanceManagementSection"));
+const load = {
+  record: () => import("@/sections/StudentRecordSection"),
+  transparency: () => import("@/sections/TransparencyBoardSection"),
+  feedback: () => import("@/sections/FeedbackSection"),
+  login: () => import("@/sections/AdminLoginSection"),
+  forgot: () => import("@/sections/ForgotPasswordSection"),
+  reset: () => import("@/sections/ResetPasswordSection"),
+  dashboard: () => import("@/sections/AdminDashboardSection"),
+  students: () => import("@/sections/StudentManagementSection"),
+  files: () => import("@/sections/RequirementFilesManagementSection"),
+  events: () => import("@/sections/EventManagementSection"),
+  contributions: () => import("@/sections/ContributionManagementSection"),
+  feedbackAdmin: () => import("@/sections/FeedbackManagementSection"),
+  reports: () => import("@/sections/ReportManagementSection"),
+  attendance: () => import("@/sections/AttendanceManagementSection"),
+};
+const StudentRecordSection = lazy(load.record);
+const TransparencyBoardSection = lazy(load.transparency);
+const FeedbackSection = lazy(load.feedback);
+const AdminLoginSection = lazy(load.login);
+const ForgotPasswordSection = lazy(load.forgot);
+const ResetPasswordSection = lazy(load.reset);
+const AdminDashboardSection = lazy(load.dashboard);
+const StudentManagementSection = lazy(load.students);
+const RequirementFilesManagementSection = lazy(load.files);
+const EventManagementSection = lazy(load.events);
+const ContributionManagementSection = lazy(load.contributions);
+const FeedbackManagementSection = lazy(load.feedbackAdmin);
+const ReportManagementSection = lazy(load.reports);
+const AttendanceManagementSection = lazy(load.attendance);
+
+/** Code each view needs, fetched before a transition so the page grows in fully drawn. */
+const VIEW_CODE: Partial<Record<ViewState, () => Promise<unknown>>> = {
+  "student-record": load.record,
+  "evaluation-required": load.record,
+  transparency: load.transparency,
+  inquiry: load.feedback,
+  complaint: load.feedback,
+  suggestion: load.feedback,
+  "admin-forgot-password": load.forgot,
+  "admin-reset-password": load.reset,
+  "admin-dashboard": () => Promise.all([load.dashboard(), load.login()]),
+  "admin-login": () => Promise.all([load.dashboard(), load.login()]),
+  "student-management": load.students,
+  "requirement-files-management": load.files,
+  "event-management": load.events,
+  "contribution-management": load.contributions,
+  "payment-management": load.contributions,
+  "transaction-management": load.transparency,
+  "feedback-management": load.feedbackAdmin,
+  "report-management": load.reports,
+  "attendance-management": load.attendance,
+};
 
 const Fallback = () => (
   <div className="mx-auto max-w-5xl px-4 pt-28">
@@ -75,10 +115,20 @@ function App() {
     offlineSyncService.configure(auth?.user.id ?? null, auth?.role ?? null);
   }, [auth]);
 
-  const navigate = (next: ViewState) => {
-    setView(next);
-    scrollToTop();
+  const navigate = async (next: ViewState) => {
+    await VIEW_CODE[next]?.().catch(() => undefined); // a failed chunk still falls back to Suspense
+    growFrom(() => {
+      setView(next);
+      scrollToTop();
+    });
   };
+
+  // Warm the public pages once the landing page is idle so they open instantly.
+  useEffect(() => {
+    const warm = () => [load.record, load.transparency, load.feedback, load.login].forEach((f) => f().catch(() => undefined));
+    const id = "requestIdleCallback" in window ? requestIdleCallback(warm, { timeout: 4000 }) : setTimeout(warm, 2500);
+    return () => ("cancelIdleCallback" in window ? cancelIdleCallback(id as number) : clearTimeout(id));
+  }, []);
 
   const handleSearch = async (name: string, studentId: string) => {
     if (!name.trim() || !studentId.trim()) {

@@ -222,7 +222,7 @@ export default function StudentRecordSection({ student, onBack }: StudentRecordS
               <EmptyState icon={Wallet} title="No contribution records found" />
             ) : (
               <>
-                <div className="overflow-x-auto">
+                <div data-lenis-prevent className="table-scroll">
                   <table className="data-table">
                     <thead>
                       <tr>
@@ -298,7 +298,7 @@ export default function StudentRecordSection({ student, onBack }: StudentRecordS
               <EmptyState icon={Calendar} title="No attendance records found" />
             ) : (
               <>
-                <div className="overflow-x-auto">
+                <div data-lenis-prevent className="table-scroll">
                   <table className="data-table">
                     <thead>
                       <tr>

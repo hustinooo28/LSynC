@@ -91,7 +91,7 @@ export default function AttendanceAnalysisChart({ events, students, records }: A
       </div>
 
       <div className="overflow-hidden rounded-2xl border border-line">
-        <div className="overflow-x-auto">
+        <div data-lenis-prevent className="table-scroll">
           <table className="data-table min-w-[620px]">
             <thead>
               <tr>

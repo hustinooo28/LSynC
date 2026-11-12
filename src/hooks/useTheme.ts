@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { growFrom } from "@/lib/transition";
 
 export type Theme = "light" | "dark";
 const KEY = "dssc-theme"; // also read by the inline script in index.html
@@ -17,13 +18,12 @@ export function useTheme() {
     } catch {
       /* storage blocked — theme still applies for this session */
     }
-    // Cross-fade the whole page where the View Transitions API exists.
     const apply = () => {
       document.documentElement.dataset.theme = next;
       setTheme(next);
     };
-    if (document.startViewTransition && !matchMedia("(prefers-reduced-motion: reduce)").matches) document.startViewTransition(apply);
-    else apply();
+    // The new theme spreads out from the toggle as a circle.
+    growFrom(apply, { shape: "circle" });
   };
 
   return { theme, toggleTheme };

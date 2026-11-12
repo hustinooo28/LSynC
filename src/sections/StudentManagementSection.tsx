@@ -245,7 +245,7 @@ export default function StudentManagementSection({ onBack }: { onBack: () => voi
             />
           ) : (
             <>
-              <div className="overflow-x-auto">
+              <div data-lenis-prevent className="table-scroll">
                 <table className="data-table">
                   <thead>
                     <tr>

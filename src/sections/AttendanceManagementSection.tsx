@@ -724,7 +724,7 @@ function AttendanceTable({ students, recordByStudent, lastScanId, toolbar, empty
       {students.length === 0 ? (
         <EmptyState icon={Users} title="No students found" description={emptyText} />
       ) : (
-        <div className="overflow-x-auto">
+        <div data-lenis-prevent className="table-scroll">
           <table className="data-table min-w-[860px]">
             <thead>
               <tr>

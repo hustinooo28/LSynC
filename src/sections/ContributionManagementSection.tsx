@@ -556,7 +556,7 @@ export default function ContributionManagementSection({ onBack, role, staffName 
           {rows.length === 0 ? (
             <EmptyState icon={Coins} title="No contribution records found" description="Try a different search or filter, or record a payment." />
           ) : (
-            <div className="overflow-x-auto">
+            <div data-lenis-prevent className="table-scroll">
               <table className="data-table">
                 <thead>
                   <tr>

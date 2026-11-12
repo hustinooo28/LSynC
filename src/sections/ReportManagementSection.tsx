@@ -271,7 +271,7 @@ export default function ReportManagementSection({ onBack }: { onBack: () => void
                     {event?.name} — {ord(Number(year))} Year · {course} · Section {section}
                   </p>
                 </div>
-                <div className="overflow-x-auto">
+                <div data-lenis-prevent className="table-scroll">
                   <table className="data-table">
                     <thead>
                       <tr>

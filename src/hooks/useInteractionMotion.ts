@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { gsap, prefersReducedMotion } from "@/lib/gsap";
+import { trackPressOrigin } from "@/lib/transition";
 
 const SPOTLIGHT = ".card-hover, .card-brand, .glass";
 const MAGNETIC = ".btn-primary, .btn-light";
@@ -14,6 +15,8 @@ const RIPPLE = ".btn";
  *  - buttons emit a soft ripple from the press point.
  */
 export function useInteractionMotion() {
+  useEffect(() => trackPressOrigin(), []);
+
   useEffect(() => {
     if (prefersReducedMotion()) return;
     const finePointer = matchMedia("(pointer: fine)").matches;
