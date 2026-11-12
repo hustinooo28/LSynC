@@ -1,314 +1,167 @@
-﻿import { useState, useEffect, useMemo } from "react";
-import {
-  Plus,
-  Edit2,
-  Trash2,
-  User,
-  FileSpreadsheet,
-  Save,
-  QrCode,
-  MoreVertical,
-} from "lucide-react";
-import { getOrdinalSuffix } from "@/lib/format";
-import SectionLoader from "@/components/SectionLoader";
-import Skeleton from "@/components/Skeleton";
-import SectionEmptyState from "@/components/SectionEmptyState";
-import SectionLayout from "@/components/common/SectionLayout";
-import ConfirmDialog from "@/components/common/ConfirmDialog";
-import SearchFilterBar from "@/components/common/SearchFilterBar";
-import { studentsService } from "@/services/db";
-import type { Student } from "@/types";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import StudentQrModal from "@/components/StudentQrModal";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
+import { Edit2, FileSpreadsheet, Plus, QrCode, Trash2, UserPlus, Users } from "lucide-react";
+import type { Student } from "@/types";
+import { studentsService } from "@/services/db";
+import { getOrdinalSuffix } from "@/lib/format";
 import { pickField } from "@/lib/spreadsheet";
-import { ATTENDANCE_COURSES } from "@/lib/kmeans";
+import { PROGRAMS } from "@/lib/constants";
 import { useSearch } from "@/hooks/useSearch";
+import { usePagination } from "@/hooks/usePagination";
 import { useSpreadsheetImport } from "@/hooks/useSpreadsheetImport";
-interface StudentManagementSectionProps {
-  onBack: () => void;
-}
+import Page from "@/components/ui/Page";
+import Modal from "@/components/ui/Modal";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import Field from "@/components/ui/Field";
+import SearchInput from "@/components/ui/SearchInput";
+import Pagination from "@/components/ui/Pagination";
+import EmptyState from "@/components/ui/EmptyState";
+import { LoadingCard } from "@/components/ui/Skeleton";
+import { Menu, MenuContent, MenuItem, MenuSeparator, RowActionsTrigger } from "@/components/ui/Menu";
+import StudentQrModal from "@/components/StudentQrModal";
 
-export default function StudentManagementSection({
-  onBack,
-}: StudentManagementSectionProps) {
+type StudentForm = Omit<Student, "id">;
+const EMPTY_FORM: StudentForm = { studentId: "", name: "", program: "", yearLevel: 1, section: "" };
+
+const yearLabel = (year: number) => `${year}${getOrdinalSuffix(year)} Year`;
+// Filter by section letter only, so "1A" and "A" group together.
+const sectionKey = (s: Student) => s.section?.trim().replace(/^\d+/, "") ?? "";
+const searchText = (s: Student) => `${s.name} ${s.studentId}`;
+const FILTERS = {
+  program: (s: Student) => s.program,
+  year: (s: Student) => String(s.yearLevel),
+  section: sectionKey,
+};
+const FILTER_LABELS = { program: "All programs", year: "All years", section: "All sections" } as const;
+
+const initials = (name: string) => {
+  const words = name.trim().split(/\s+/);
+  return ((words[0]?.[0] ?? "") + (words.length > 1 ? words[words.length - 1][0] : "")).toUpperCase();
+};
+
+const uniqueSorted = <T,>(values: T[]) =>
+  [...new Set(values.filter((v) => v !== "" && v != null))].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+export default function StudentManagementSection({ onBack }: { onBack: () => void }) {
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [editingStudent, setEditingStudent] = useState<Student | null>(null);
+  // `null` = closed, `"new"` = add, a Student = edit.
+  const [editing, setEditing] = useState<Student | "new" | null>(null);
+  const [form, setForm] = useState<StudentForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
+  const [toDelete, setToDelete] = useState<Student | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [qrStudent, setQrStudent] = useState<Student | null>(null);
 
-  // Form state for adding/editing
-  const [formData, setFormData] = useState({
-    studentId: "",
-    name: "",
-    program: "",
-    yearLevel: 1,
-    section: "",
-  });
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [studentToDelete, setStudentToDelete] = useState<Student | null>(null);
-  // Load students from database
   useEffect(() => {
-    loadStudents();
+    studentsService
+      .getAll()
+      .then(setStudents)
+      .catch((error) => {
+        console.error("Error loading students:", error);
+        toast.error("Failed to load students");
+      })
+      .finally(() => setLoading(false));
   }, []);
 
-  const loadStudents = async () => {
-    try {
-      setLoading(true);
-      const data = await studentsService.getAll();
-      setStudents(data);
-    } catch (error) {
-      console.error("Error loading students:", error);
-      toast.error("Failed to load students");
-    } finally {
-      setLoading(false);
-    }
+  const { query, setQuery, filters, setFilter, filtered } = useSearch(students, searchText, FILTERS);
+  const { pageItems, pagination } = usePagination(filtered, 15);
+
+  const options = useMemo(
+    () => ({
+      program: uniqueSorted(students.map((s) => s.program?.trim())).map((p) => [p, p]),
+      year: uniqueSorted(students.map((s) => s.yearLevel)).map((y) => [String(y), yearLabel(y)]),
+      section: uniqueSorted(students.map(sectionKey)).map((s) => [s, `Section ${s}`]),
+    }),
+    [students],
+  );
+
+  const isDuplicateId = (studentId: string, exceptId?: string) =>
+    students.some((s) => s.id !== exceptId && s.studentId.toLowerCase() === studentId.toLowerCase());
+
+  const openForm = (student: Student | "new") => {
+    setForm(student === "new" ? EMPTY_FORM : { ...student });
+    setEditing(student);
   };
 
-  const {
-    searchTerm,
-    setSearchTerm,
-    filters,
-    setFilter,
-    filtered: filteredStudents,
-  } = useSearch<Student>({
-    items: students,
-    searchKeys: ["name", "studentId"],
-    filters: {
-      program: (s) => s.program,
-      year: (s) => s.yearLevel.toString(),
-      section: (s) => s.section?.trim().replace(/^\d+/, "") ?? "",
-    },
-  });
-
-  const programs = useMemo(
-    () =>
-      [
-        ...new Set(
-          students
-            .map((s) => s.program?.trim())
-            .filter((program): program is string => Boolean(program)),
-        ),
-      ].sort(),
-    [students],
-  );
-  const yearLevels = useMemo(
-    () => [...new Set(students.map((s) => s.yearLevel))].sort(),
-    [students],
-  );
-  const sections = useMemo(
-    () =>
-      [
-        ...new Set(
-          students
-            .map((s) => s.section?.trim().replace(/^\d+/, ""))
-            .filter((section): section is string => Boolean(section)),
-        ),
-      ].sort(),
-    [students],
-  );
-  const handleAddStudent = async () => {
-    const studentId = formData.studentId.trim();
-    const name = formData.name.trim();
-    const program = formData.program.trim();
-    const section = formData.section.trim();
-    if (!studentId || !name || !program || !section) {
+  const save = async () => {
+    if (!editing) return;
+    const data: StudentForm = {
+      studentId: form.studentId.trim(),
+      name: form.name.trim(),
+      program: form.program.trim(),
+      yearLevel: form.yearLevel,
+      section: form.section.trim(),
+    };
+    if (!data.studentId || !data.name || !data.program || !data.section) {
       toast.error("Please complete all student fields");
       return;
     }
-    if (
-      students.some(
-        (student) =>
-          student.studentId.toLowerCase() === studentId.toLowerCase(),
-      )
-    ) {
+    const current = editing === "new" ? null : editing;
+    if (isDuplicateId(data.studentId, current?.id)) {
       toast.error("A student with this Student ID already exists");
       return;
     }
+    setSaving(true);
     try {
-      setSaving(true);
-      const newStudent = await studentsService.create({
-        studentId,
-        name,
-        program,
-        yearLevel: formData.yearLevel,
-        section,
-      });
-      setStudents([...students, newStudent]);
-      setShowAddModal(false);
-      setFormData({
-        studentId: "",
-        name: "",
-        program: "",
-        yearLevel: 1,
-        section: "",
-      });
-      toast.success("Student added successfully");
+      if (current) {
+        const updated = await studentsService.update(current.id, data);
+        setStudents((prev) => prev.map((s) => (s.id === current.id ? updated : s)));
+      } else {
+        const created = await studentsService.create(data);
+        setStudents((prev) => [...prev, created]);
+      }
+      toast.success(`Student ${current ? "updated" : "added"} successfully`);
+      setEditing(null);
     } catch (error) {
-      console.error("Error adding student:", error);
-      toast.error("Failed to add student");
+      console.error("Error saving student:", error);
+      toast.error(`Failed to ${current ? "update" : "add"} student`);
     } finally {
       setSaving(false);
     }
   };
 
-  const handleEditStudent = async () => {
-    if (editingStudent) {
-      const studentId = formData.studentId.trim();
-      const name = formData.name.trim();
-      const program = formData.program.trim();
-      const section = formData.section.trim();
-      if (!studentId || !name || !program || !section) {
-        toast.error("Please complete all student fields");
-        return;
-      }
-      if (
-        students.some(
-          (student) =>
-            student.id !== editingStudent.id &&
-            student.studentId.toLowerCase() === studentId.toLowerCase(),
-        )
-      ) {
-        toast.error("A student with this Student ID already exists");
-        return;
-      }
-      try {
-        setSaving(true);
-        const updated = await studentsService.update(editingStudent.id, {
-          studentId,
-          name,
-          program,
-          yearLevel: formData.yearLevel,
-          section,
-        });
-        setStudents(
-          students.map((s) => (s.id === editingStudent.id ? updated : s)),
-        );
-        setEditingStudent(null);
-        setFormData({
-          studentId: "",
-          name: "",
-          program: "",
-          yearLevel: 1,
-          section: "",
-        });
-        toast.success("Student updated successfully");
-      } catch (error) {
-        console.error("Error updating student:", error);
-        toast.error("Failed to update student");
-      } finally {
-        setSaving(false);
-      }
-    }
-  };
-
-  const handleDeleteStudent = (student: Student) => {
-    setStudentToDelete(student);
-    setShowDeleteConfirm(true);
-  };
-  const confirmDeleteStudent = async () => {
-    if (!studentToDelete) return;
-
+  const confirmDelete = async () => {
+    if (!toDelete) return;
+    setDeleting(true);
     try {
-      await studentsService.delete(studentToDelete.id);
-
-      setStudents((prev) =>
-        prev.filter((student) => student.id !== studentToDelete.id),
-      );
-
-      toast.success(`${studentToDelete.name} has been deleted.`);
-
-      setShowDeleteConfirm(false);
-      setStudentToDelete(null);
+      await studentsService.delete(toDelete.id);
+      setStudents((prev) => prev.filter((s) => s.id !== toDelete.id));
+      toast.success(`${toDelete.name} has been deleted.`);
+      setToDelete(null);
     } catch (error) {
       console.error("Error deleting student:", error);
-      toast.error(`Failed to delete ${studentToDelete.name}.`);
+      toast.error(`Failed to delete ${toDelete.name}.`);
+    } finally {
+      setDeleting(false);
     }
   };
-  const openEditModal = (student: Student) => {
-    setEditingStudent(student);
-    setFormData({
-      studentId: student.studentId,
-      name: student.name,
-      program: student.program,
-      yearLevel: student.yearLevel,
-      section: student.section,
-    });
-  };
 
-  const openAddModal = () => {
-    setEditingStudent(null);
-    setFormData({
-      studentId: "",
-      name: "",
-      program: "",
-      yearLevel: 1,
-      section: "",
-    });
-    setShowAddModal(true);
-  };
-
-  const importStudentRows = async (rows: Record<string, string>[]) => {
-    if (rows.length === 0) {
-      toast.error("File is empty or invalid");
-      return;
-    }
-
-    const parsed = rows
-      .map(mapCsvRowToStudent)
-      .filter((s): s is Omit<Student, "id"> => s !== null);
-
+  const importRows = async (rows: Record<string, string>[]) => {
+    if (rows.length === 0) return void toast.error("File is empty or invalid");
+    const parsed = rows.map(rowToStudent).filter((s): s is StudentForm => s !== null);
     if (parsed.length === 0) {
-      toast.error(
-        "No valid rows found. Expected columns: Student ID, Name, Program, Year Level, Section",
-      );
-      return;
+      return void toast.error("No valid rows found. Expected columns: Student ID, Name, Program, Year Level, Section");
     }
 
-    // Skip rows already in the table or duplicated within the file.
-    const existingIds = new Set(students.map((s) => s.studentId.toLowerCase()));
-    const seen = new Set<string>();
-    const deduped = parsed.filter((s) => {
+    // Skip rows already in the table or repeated within the file.
+    const seen = new Set(students.map((s) => s.studentId.toLowerCase()));
+    const fresh = parsed.filter((s) => {
       const key = s.studentId.toLowerCase();
-      if (existingIds.has(key) || seen.has(key)) return false;
+      if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+    if (fresh.length === 0) return void toast.info("All rows in the file already exist in the table");
 
-    if (deduped.length === 0) {
-      toast.info("All rows in the file already exist in the table");
-      return;
-    }
-
-    const { created, failed } = await studentsService.createMany(deduped);
+    const { created, failed } = await studentsService.createMany(fresh);
     setStudents((prev) => [...prev, ...created]);
-    const skipped = parsed.length - deduped.length;
+    const skipped = parsed.length - fresh.length;
 
     if (failed.length > 0) {
-      const shown = failed
-        .slice(0, 5)
-        .map((f) => `${f.name || f.studentId}: ${f.error}`);
+      const shown = failed.slice(0, 5).map((f) => `${f.name || f.studentId}: ${f.error}`);
       const more = failed.length > 5 ? `, +${failed.length - 5} more` : "";
-      toast.error(
-        `${created.length} imported, ${failed.length} row(s) failed`,
-        {
-          description: shown.join("; ") + more,
-        },
-      );
+      toast.error(`${created.length} imported, ${failed.length} row(s) failed`, { description: shown.join("; ") + more });
     } else {
       toast.success(
         skipped > 0
@@ -318,47 +171,33 @@ export default function StudentManagementSection({
     }
   };
 
-  // Shared CSV / Excel file-read shell + importing state (row mapping handled by
-  // importStudentRows above).
-  const { importing, handleFileSelected, importInputRef } =
-    useSpreadsheetImport({
-      onRows: importStudentRows,
-    });
+  const { importing, handleFileSelected, importInputRef } = useSpreadsheetImport({ onRows: importRows });
+  const set = <K extends keyof StudentForm>(key: K, value: StudentForm[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const formIncomplete = !form.studentId.trim() || !form.name.trim() || !form.program.trim() || !form.section.trim();
 
   return (
-    <SectionLayout
+    <Page
+      eyebrow="Records"
       title="Student Management"
-      subtitle="Manage student records and information"
+      subtitle="Manage student records, attendance passes and bulk imports."
       onBack={onBack}
-      headerActions={
+      actions={
         <>
           <button
             onClick={() => importInputRef.current?.click()}
-            className="glass-button px-4 py-2.5 text-sm"
+            className="btn border border-white/20 bg-white/10 text-white hover:bg-white/20"
             disabled={loading || importing}
-            title="Import students from a CSV (.csv) or Excel (.xlsx) file. Expected columns: Student ID, Name, Program, Year Level, Section."
+            title="Import from .csv or .xlsx. Expected columns: Student ID, Name, Program, Year Level, Section."
           >
-            {importing ? (
-              <Skeleton className="h-4 w-4 rounded-full" />
-            ) : (
-              <FileSpreadsheet className="w-4 h-4" />
-            )}
-            <span className="hidden sm:inline">
-              {importing ? "Importing..." : "Upload CSV / Excel"}
-            </span>
+            <FileSpreadsheet className="h-4 w-4" />
+            {importing ? "Importing…" : "Import CSV / Excel"}
           </button>
-          <button
-            onClick={openAddModal}
-            className="btn-primary px-4 py-2.5 text-sm"
-            disabled={loading || importing}
-          >
-            <Plus className="w-4 h-4" />
-            <span>Add Student</span>
+          <button onClick={() => openForm("new")} className="btn btn-primary" disabled={loading || importing}>
+            <Plus className="h-4 w-4" /> Add student
           </button>
         </>
       }
     >
-      {/* Hidden file input for CSV / Excel import */}
       <input
         ref={importInputRef}
         type="file"
@@ -367,400 +206,168 @@ export default function StudentManagementSection({
         onChange={handleFileSelected}
       />
 
-      {/* Filters */}
-      <div className="glass-card p-4 mb-4 flex flex-wrap gap-3">
-        <SearchFilterBar
-          value={searchTerm}
-          onChange={setSearchTerm}
-          placeholder="Search students..."
-          className="flex-1 min-w-[200px]"
-        />
-        <select
-          value={filters.program}
-          onChange={(e) => setFilter("program", e.target.value)}
-          className="glass-input px-4 py-2 text-sm"
-          disabled={loading}
-        >
-          <option value="">All Programs</option>
-          {programs.map((program) => (
-            <option key={program} value={program}>
-              {program}
-            </option>
+      <div className="card flex flex-col gap-3 p-4 lg:flex-row lg:items-center">
+        <SearchInput value={query} onChange={setQuery} placeholder="Search by name or student ID…" className="flex-1" />
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 lg:w-auto">
+          {(Object.keys(FILTER_LABELS) as (keyof typeof FILTER_LABELS)[]).map((key) => (
+            <select
+              key={key}
+              value={filters[key] ?? ""}
+              onChange={(e) => setFilter(key, e.target.value)}
+              className="input lg:w-40"
+              disabled={loading}
+              aria-label={FILTER_LABELS[key]}
+            >
+              <option value="">{FILTER_LABELS[key]}</option>
+              {options[key].map(([value, label]) => (
+                <option key={value} value={value}>{label}</option>
+              ))}
+            </select>
           ))}
-        </select>
-        <select
-          value={filters.year}
-          onChange={(e) => setFilter("year", e.target.value)}
-          className="glass-input px-4 py-2 text-sm"
-          disabled={loading}
-        >
-          <option value="">All Years</option>
-          {yearLevels.map((year) => (
-            <option key={year} value={year}>
-              {year}
-              {getOrdinalSuffix(year)} Year
-            </option>
-          ))}
-        </select>
-        <select
-          value={filters.section}
-          onChange={(e) => setFilter("section", e.target.value)}
-          className="glass-input px-4 py-2 text-sm"
-          disabled={loading}
-        >
-          <option value="">All Sections</option>
-
-          {sections.map((section) => (
-            <option key={section} value={section}>
-              Section {section}
-            </option>
-          ))}
-        </select>
+        </div>
       </div>
 
-      {/* Loading State */}
-      {loading && <SectionLoader message="Loading students..." />}
-
-      {/* Students Table */}
-      {!loading && (
-        <div className="glass-card overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="glass-table w-full">
-              <colgroup>
-                <col className="w-[35%]" />
-                <col className="w-auto" />
-                <col className="w-[300px]" />
-              </colgroup>
-
-              <thead>
-                <tr>
-                  <th className="!text-center px-3 py-2.5">Student</th>
-
-                  <th className="!text-center px-3 py-2.5">
-                    Program - Year - Section
-                  </th>
-
-                  <th className="!text-right whitespace-nowrap px-3 py-2.5">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-
-              <tbody>
-                {filteredStudents.map((student) => (
-                  <tr key={student.id} className="group">
-                    <td className="!text-center px-5 py-2.5">
-                      <div className="inline-block w-[400px] max-w-full text-left">
-                        <div className="flex items-center gap-10">
-                          {/* Avatar */}
-                          <div className="w-9 h-9 shrink-0 rounded-full bg-red/10 flex items-center justify-center">
-                            <User className="w-4 h-4 text-red" />
-                          </div>
-
-                          {/* Name + Student ID */}
-                          <div className="min-w-0 flex-1 leading-tight">
-                            <div className="font-medium text-dark text-[19px] truncate">
-                              {student.name}
-                            </div>
-
-                            <div className="text-xs text-gray-400 text-[15px] mt-1">
-                              {student.studentId}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-
-                    {/* Program / Year / Section */}
-                    <td className="!text-center px-5 py-2.5">
-                      <div className="inline-block w-[250px] max-w-full text-left">
-                        <div className="text-text-secondary text-[17px] whitespace-nowrap ">
-                          <span className="font-medium text-dark">
-                            {student.program}
-                          </span>
-
-                          <span className="mx-1.5 text-gray-300"> • </span>
-
-                          <span>
-                            {student.yearLevel}
-                            {getOrdinalSuffix(student.yearLevel)} Year
-                          </span>
-
-                          <span className="mx-1.5 text-gray-300"> • </span>
-
-                          <span>Section {student.section}</span>
-                        </div>
-                      </div>
-                    </td>
-
-                    {/* Actions */}
-                    <td className="!text-right px-3 py-2">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <button
-                            className="inline-flex items-center justify-center w-7 h-7 rounded-lg hover:bg-black/5 transition-colors"
-                            aria-label={`Actions for ${student.name}`}
-                            title="Student actions"
-                          >
-                            <MoreVertical className="w-4 h-4 text-dark" />
-                          </button>
-                        </DropdownMenuTrigger>
-
-                        <DropdownMenuContent align="end" className="w-40">
-                          <DropdownMenuItem
-                            onSelect={() => setQrStudent(student)}
-                          >
-                            <QrCode className="w-4 h-4" />
-                            Show QR
-                          </DropdownMenuItem>
-
-                          <DropdownMenuItem
-                            onSelect={() => openEditModal(student)}
-                          >
-                            <Edit2 className="w-4 h-4" />
-                            Edit
-                          </DropdownMenuItem>
-
-                          <DropdownMenuSeparator />
-
-                          <DropdownMenuItem
-                            variant="destructive"
-                            onSelect={() => handleDeleteStudent(student)}
-                          >
-                            <Trash2 className="w-4 h-4" />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {loading ? (
+        <LoadingCard label="Loading students…" />
+      ) : (
+        <div className="card overflow-hidden">
+          <div className="flex items-center justify-between gap-3 px-5 py-4">
+            <h2 className="font-bold text-ink">Students</h2>
+            <span className="chip chip-brand">
+              {filtered.length === students.length ? `${students.length} total` : `${filtered.length} of ${students.length}`}
+            </span>
           </div>
-
-          {filteredStudents.length === 0 && (
-            <SectionEmptyState
-              message="No students found"
-              icon={User}
-              compact
+          {filtered.length === 0 ? (
+            <EmptyState
+              icon={Users}
+              title="No students found"
+              description={students.length ? "Try a different search or filter." : "Add a student or import a spreadsheet to get started."}
             />
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Student</th>
+                      <th>Program</th>
+                      <th>Year</th>
+                      <th>Section</th>
+                      <th className="w-12" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageItems.map((s) => (
+                      <tr key={s.id}>
+                        <td>
+                          <div className="flex items-center gap-3">
+                            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-brand-500/10 text-xs font-bold text-brand-600">
+                              {initials(s.name)}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="truncate font-semibold">{s.name}</p>
+                              <p className="text-xs text-muted">{s.studentId}</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td><span className="chip chip-brand">{s.program}</span></td>
+                        <td className="whitespace-nowrap text-muted">{yearLabel(s.yearLevel)}</td>
+                        <td className="text-muted">{s.section}</td>
+                        <td className="text-right">
+                          <Menu>
+                            <RowActionsTrigger label={`Actions for ${s.name}`} />
+                            <MenuContent>
+                              <MenuItem onSelect={() => setQrStudent(s)}><QrCode /> Show QR</MenuItem>
+                              <MenuItem onSelect={() => openForm(s)}><Edit2 /> Edit</MenuItem>
+                              <MenuSeparator />
+                              <MenuItem danger onSelect={() => setToDelete(s)}><Trash2 /> Delete</MenuItem>
+                            </MenuContent>
+                          </Menu>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination {...pagination} />
+            </>
           )}
         </div>
       )}
 
-      {/* Stats */}
-      <div className="mt-4 flex flex-wrap gap-4 text-sm text-text-secondary">
-        <span>
-          Total Students:{" "}
-          <strong className="text-dark">{students.length}</strong>
-        </span>
-        <span>
-          Filtered:{" "}
-          <strong className="text-dark">{filteredStudents.length}</strong>
-        </span>
-      </div>
-
-      {/* Add/Edit Modal */}
-      <Dialog
-        open={showAddModal || !!editingStudent}
-        onOpenChange={() => {
-          setShowAddModal(false);
-          setEditingStudent(null);
-        }}
+      <Modal
+        open={editing !== null}
+        onClose={() => !saving && setEditing(null)}
+        icon={<UserPlus className="h-5 w-5 text-brand-500" />}
+        title={editing === "new" ? "Add student" : "Edit student"}
+        description="Student ID must be unique."
+        footer={
+          <>
+            <button className="btn btn-secondary" onClick={() => setEditing(null)} disabled={saving}>Cancel</button>
+            <button className="btn btn-primary" onClick={save} disabled={saving || formIncomplete}>
+              {saving ? "Saving…" : editing === "new" ? "Save student" : "Update student"}
+            </button>
+          </>
+        }
       >
-        <DialogContent className="glass-card-strong max-w-md">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              {editingStudent ? "Edit Student" : "Add New Student"}
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-4 mt-4">
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Student ID
-              </label>
-              <input
-                type="text"
-                value={formData.studentId}
-                onChange={(e) =>
-                  setFormData({ ...formData, studentId: e.target.value })
-                }
-                className="glass-input w-full px-4 py-2"
-                placeholder="e.g., 2021-00001"
-                disabled={saving}
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Full Name
-              </label>
-              <input
-                type="text"
-                value={formData.name}
-                onChange={(e) =>
-                  setFormData({ ...formData, name: e.target.value })
-                }
-                className="glass-input w-full px-4 py-2"
-                placeholder="e.g., Juan Dela Cruz"
-                disabled={saving}
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">
-                Program
-              </label>
-              <input
-                type="text"
-                list="program-suggestions"
-                value={formData.program}
-                onChange={(e) =>
-                  setFormData({ ...formData, program: e.target.value })
-                }
-                className="glass-input w-full px-4 py-2"
-                placeholder="e.g., BSIT, ACT, DIT"
-                disabled={saving}
-              />
-              <datalist id="program-suggestions">
-                {ATTENDANCE_COURSES.map((course) => (
-                  <option key={course} value={course} />
-                ))}
-              </datalist>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1">
-                  Year Level
-                </label>
-                <select
-                  value={formData.yearLevel}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      yearLevel: parseInt(e.target.value),
-                    })
-                  }
-                  className="glass-input w-full px-4 py-2"
-                  disabled={saving}
-                >
-                  {[1, 2, 3, 4, 5].map((year) => (
-                    <option key={year} value={year}>
-                      {year}
-                      {getOrdinalSuffix(year)} Year
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1">
-                  Section
-                </label>
-                <input
-                  type="text"
-                  value={formData.section}
-                  onChange={(e) =>
-                    setFormData({ ...formData, section: e.target.value })
-                  }
-                  className="glass-input w-full px-4 py-2"
-                  placeholder="e.g., A"
-                  disabled={saving}
-                />
-              </div>
-            </div>
-
-            <div className="flex gap-3 pt-4">
-              <button
-                onClick={() => {
-                  setShowAddModal(false);
-                  setEditingStudent(null);
-                }}
-                className="flex-1 glass-button px-4 py-2.5"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={editingStudent ? handleEditStudent : handleAddStudent}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2"
-                disabled={
-                  saving ||
-                  !formData.studentId ||
-                  !formData.name ||
-                  !formData.program ||
-                  !formData.section
-                }
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    <Save className="w-4 h-4" />
-                    {editingStudent ? "Update" : "Save"}
-                  </>
-                )}
-              </button>
-            </div>
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            save();
+          }}
+        >
+          <Field label="Student ID">
+            <input className="input" value={form.studentId} onChange={(e) => set("studentId", e.target.value)} placeholder="e.g. 2021-00001" disabled={saving} />
+          </Field>
+          <Field label="Full name">
+            <input className="input" value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="e.g. Juan Dela Cruz" disabled={saving} />
+          </Field>
+          <Field label="Program">
+            <input className="input" list="program-suggestions" value={form.program} onChange={(e) => set("program", e.target.value)} placeholder="e.g. BSIT, ACT, DIT" disabled={saving} />
+            <datalist id="program-suggestions">
+              {PROGRAMS.map((p) => <option key={p} value={p} />)}
+            </datalist>
+          </Field>
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Year level">
+              <select className="input" value={form.yearLevel} onChange={(e) => set("yearLevel", Number(e.target.value))} disabled={saving}>
+                {[1, 2, 3, 4, 5].map((y) => <option key={y} value={y}>{yearLabel(y)}</option>)}
+              </select>
+            </Field>
+            <Field label="Section">
+              <input className="input" value={form.section} onChange={(e) => set("section", e.target.value)} placeholder="e.g. A" disabled={saving} />
+            </Field>
           </div>
-        </DialogContent>
-      </Dialog>
-      {/* Delete Student Confirmation Dialog */}
+          <button type="submit" hidden />
+        </form>
+      </Modal>
+
       <ConfirmDialog
-        open={showDeleteConfirm}
-        onClose={() => {
-          setShowDeleteConfirm(false);
-          setStudentToDelete(null);
-        }}
-        onConfirm={confirmDeleteStudent}
-        title="Delete Student"
-        description={`Are you sure you want to delete ${studentToDelete?.name ?? "this student"}?`}
-        warningText="This action cannot be undone. The student's record and all related contributions, attendance, and payment records will be permanently removed."
-        confirmLabel="Delete Student"
+        open={!!toDelete}
+        onClose={() => setToDelete(null)}
+        onConfirm={confirmDelete}
+        loading={deleting}
+        title="Delete student"
+        description={`Delete ${toDelete?.name ?? "this student"}? Their contributions, attendance and payment records will be permanently removed. This cannot be undone.`}
+        confirmLabel="Delete student"
       />
-      {/* Attendance QR Code Modal */}
       <StudentQrModal student={qrStudent} onClose={() => setQrStudent(null)} />
-    </SectionLayout>
+    </Page>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Import helpers
-// ---------------------------------------------------------------------------
-
-/** Flexibly maps one CSV/Excel row to a Student. Returns null when name and ID are missing. */
-function mapCsvRowToStudent(
-  row: Record<string, string>,
-): Omit<Student, "id"> | null {
-  const studentId = pickField(
-    row,
-    "studentid",
-    "studentno",
-    "studentnumber",
-    "studid",
-    "idnumber",
-    "lrn",
-    "id",
-  );
+/** Maps one import row to a student; `null` when ID or name is missing. */
+function rowToStudent(row: Record<string, string>): StudentForm | null {
+  const studentId = pickField(row, "studentid", "studentno", "studentnumber", "studid", "idnumber", "lrn", "id");
   const name = pickField(row, "name", "fullname", "studentname");
   if (!studentId || !name) return null;
-
-  const yearRaw = parseInt(
-    pickField(row, "yearlevel", "year", "gradelevel", "grade", "gradelvl"),
-    10,
-  );
-
+  const year = parseInt(pickField(row, "yearlevel", "year", "gradelevel", "grade", "gradelvl"), 10);
   return {
     studentId,
     name,
     program: pickField(row, "program", "course", "degree", "programofstudy"),
-    yearLevel: Number.isNaN(yearRaw) || yearRaw < 1 ? 1 : yearRaw,
+    yearLevel: Number.isNaN(year) || year < 1 ? 1 : year,
     section: pickField(row, "section", "class", "block"),
   };
 }

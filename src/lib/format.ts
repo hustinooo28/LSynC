@@ -1,92 +1,56 @@
-/**
- * Shared date & formatting helpers.
- *
- * These were previously declared independently in several section components;
- * import them from here instead of re-declaring local copies.
- */
-
-/**
- * Formats a date (ISO string or Date) as e.g. `Sep 8, 2026`.
- * Returns "-" for empty input and the original string for invalid dates.
- */
-export function formatDate(dateString: string | Date): string {
-  if (!dateString) return "-";
-  const date = dateString instanceof Date ? dateString : new Date(dateString);
-  if (Number.isNaN(date.getTime())) return String(dateString);
-  return date.toLocaleDateString("en-US", {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+/** e.g. `Sep 8, 2026`; "-" for empty input, the raw value when unparseable. */
+export function formatDate(value: string | Date): string {
+  if (!value) return "-";
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
 }
 
-/**
- * Formats a peso amount the way the rest of the app displays money, e.g.
- * `1500 -> "₱1,500"`. Use this instead of inline `₱{n.toLocaleString()}`.
- */
+/** e.g. `1500 -> "₱1,500"`. */
 export function formatPeso(amount: number): string {
   return `₱${amount.toLocaleString("en-US")}`;
 }
 
-/** Ordinal suffix for a number, e.g. `1 -> "st"`, `22 -> "nd"`. */
+/** e.g. `1 -> "st"`, `22 -> "nd"`, `13 -> "th"`. */
 export function getOrdinalSuffix(num: number): string {
   const suffixes = ["th", "st", "nd", "rd"];
   const v = num % 100;
   return suffixes[(v - 20) % 10] || suffixes[v] || suffixes[0];
 }
 
-/** Whole days (rounded up) between now and the given ISO date. */
+/** Whole days (rounded up) from now until `date`. */
 export function daysUntil(date: string): number {
   return Math.ceil((new Date(date).getTime() - Date.now()) / 86400000);
 }
 
-/** Today's date as a UTC `YYYY-MM-DD` string (same as the original helper). */
+/** Today as a UTC `YYYY-MM-DD` string. */
 export function today(): string {
   return new Date().toISOString().split("T")[0];
 }
 
-/**
- * Converts a 24h `HH:MM` (or `H:MM`) time to a 12-hour label, e.g.
- * `"06:30" -> "6:30 AM"`, `"17:00" -> "5:00 PM"`. Returns "—" for empty
- * input and the raw string when it does not look like a time.
- */
+/** 24h "HH:MM" -> "6:30 AM"; "—" when empty, the raw value when not a time. */
 export function formatTime12(value?: string): string {
   if (!value) return "—";
   const match = /^(\d{1,2}):(\d{2})/.exec(value.trim());
   if (!match) return value;
   const hour = Number(match[1]);
-  const minute = match[2];
-  const period = hour >= 12 ? "PM" : "AM";
-  const hour12 = hour % 12 === 0 ? 12 : hour % 12;
-  return `${hour12}:${minute} ${period}`;
+  return `${hour % 12 || 12}:${match[2]} ${hour >= 12 ? "PM" : "AM"}`;
 }
 
-/** "HH:MM AM" range label, e.g. "6:00 AM – 12:00 PM". */
+/** e.g. "6:00 AM – 12:00 PM". */
 export function formatTimeRange(timeIn?: string, timeOut?: string): string {
   return `${formatTime12(timeIn)} – ${formatTime12(timeOut)}`;
 }
 
-/**
- * Parses a 24h `HH:MM` (or `H:MM`) time into minutes since midnight. Returns
- * `null` when the value is missing or does not look like a valid clock time.
- */
-export function timeToMinutes(value?: string): number | null {
+function timeToMinutes(value?: string): number | null {
   const match = /^(\d{1,2}):(\d{2})/.exec((value ?? "").trim());
   if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (hour > 23 || minute > 59) return null;
-  return hour * 60 + minute;
+  const [hour, minute] = [Number(match[1]), Number(match[2])];
+  return hour > 23 || minute > 59 ? null : hour * 60 + minute;
 }
 
-/**
- * Compares two 24h `HH:MM` times: negative when `a` is earlier than `b`, `0`
- * when equal (or either is unparseable), positive when `a` is later. Used to
- * decide attendance status from a QR scan time vs. the event's scheduled time.
- */
+/** Sign of (a - b) for 24h "HH:MM" times; 0 when equal or either is unparseable. */
 export function compareTime24(a?: string, b?: string): number {
-  const minutesA = timeToMinutes(a);
-  const minutesB = timeToMinutes(b);
-  if (minutesA === null || minutesB === null) return 0;
-  return minutesA - minutesB;
+  const [minutesA, minutesB] = [timeToMinutes(a), timeToMinutes(b)];
+  return minutesA === null || minutesB === null ? 0 : minutesA - minutesB;
 }

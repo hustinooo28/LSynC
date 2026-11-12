@@ -1,341 +1,284 @@
-﻿import { useState, useEffect, useRef } from "react";
-import { gsap } from "gsap";
-import { Search, ChevronDown, Eye } from "lucide-react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { ArrowRight, BadgeCheck, CalendarCheck, Eye, FileCheck2, Loader2, ReceiptText, ShieldCheck, UserRound, Wallet } from "lucide-react";
 import type { Student } from "@/types";
 import { studentsService } from "@/services/db";
+import { cn } from "@/lib/utils";
 import LSCOfficerCarousel from "@/components/LSCOfficerCarousel";
-import Skeleton from "@/components/Skeleton";
+import FacebookFeed from "@/components/FacebookFeed";
+import SplitText from "@/components/motion/SplitText";
+import Reveal from "@/components/motion/Reveal";
+import { gsap, useGSAP, prefersReducedMotion } from "@/lib/gsap";
+
 interface LandingSectionProps {
   onSearch: (name: string, studentId: string) => void;
   onViewTransparency: () => void;
   searching?: boolean;
 }
 
-export default function LandingSection({
-  onSearch,
-  onViewTransparency,
-  searching = false,
-}: LandingSectionProps) {
+export default function LandingSection({ onSearch, onViewTransparency, searching = false }: LandingSectionProps) {
   const [name, setName] = useState("");
   const [studentId, setStudentId] = useState("");
-  const [studentMatches, setStudentMatches] = useState<Student[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const sectionRef = useRef<HTMLDivElement>(null);
-  const headlineRef = useRef<HTMLDivElement>(null);
-  const cardRef = useRef<HTMLDivElement>(null);
-  const scrollHintRef = useRef<HTMLDivElement>(null);
-  const handleNameChange = (value: string) => {
-    setName(value);
+  const [matches, setMatches] = useState<Student[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const picked = useRef(""); // name chosen from the list — don't search it again
+  const nameRef = useRef<HTMLInputElement>(null);
+  const heroRef = useRef<HTMLElement>(null);
 
-    if (!value.trim()) {
-      setStudentMatches([]);
-      setShowSuggestions(false);
-    }
-  };
+  // Hero choreography: intro elements rise after the headline, preview cards
+  // fly in, then drift upward (parallax) as the hero scrolls away.
+  useGSAP(
+    () => {
+      if (prefersReducedMotion()) return;
+      gsap.from(".hero-intro", { y: 28, opacity: 0, filter: "blur(6px)", stagger: 0.1, delay: 0.45, clearProps: "filter,transform" });
+      gsap.from(".hero-card", { y: 140, opacity: 0, rotate: 0, stagger: 0.12, delay: 0.7, duration: 1.3, ease: "expo.out" });
+      gsap.to(".hero-cards", { yPercent: -30, ease: "none", scrollTrigger: { trigger: heroRef.current, start: "top top", end: "bottom top", scrub: true } });
+    },
+    { scope: heroRef },
+  );
 
+  // Debounced name autocomplete; `stale` drops responses for older keystrokes.
   useEffect(() => {
+    const q = name.trim();
+    if (!q || q === picked.current) return;
+    let stale = false;
     const timer = setTimeout(async () => {
-      if (!name.trim()) {
-        setStudentMatches([]);
-        return;
-      }
-
-      setSearchLoading(true);
-
       try {
-        const matches = await studentsService.search(name.trim());
-
-        setStudentMatches(matches.slice(0, 8));
-        setShowSuggestions(true);
+        const found = await studentsService.search(q);
+        if (!stale) setMatches(found.slice(0, 8));
       } catch (error) {
         console.error("Student search failed:", error);
-        setStudentMatches([]);
+        if (!stale) setMatches([]);
       } finally {
-        setSearchLoading(false);
+        if (!stale) setLoading(false);
       }
     }, 250);
-
-    return () => clearTimeout(timer);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
   }, [name]);
-  useEffect(() => {
-    const ctx = gsap.context(() => {
-      // Initial animation timeline
-      const tl = gsap.timeline({ defaults: { ease: "power3.out" } });
 
-      // Background fade in
-      tl.fromTo(
-        sectionRef.current,
-        { opacity: 0 },
-        { opacity: 1, duration: 0.6 },
-      );
-
-      // Headline animation
-      tl.fromTo(
-        headlineRef.current?.querySelectorAll(".word") || [],
-        { y: 24, opacity: 0 },
-        { y: 0, opacity: 1, duration: 0.7, stagger: 0.03 },
-        "-=0.3",
-      );
-
-      // Search card animation
-      tl.fromTo(
-        cardRef.current,
-        { x: "10vw", scale: 0.96, opacity: 0 },
-        { x: 0, scale: 1, opacity: 1, duration: 0.8 },
-        "-=0.5",
-      );
-
-      // Scroll hint
-      tl.fromTo(
-        scrollHintRef.current,
-        { opacity: 0 },
-        { opacity: 1, duration: 0.4 },
-        "-=0.2",
-      );
-    }, sectionRef);
-
-    return () => ctx.revert();
-  }, []);
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!searching) {
-      onSearch(name, studentId);
-    }
+  const changeName = (value: string) => {
+    picked.current = "";
+    setName(value);
+    setOpen(!!value.trim());
+    setLoading(!!value.trim());
+    if (!value.trim()) setMatches([]);
   };
+
+  const pick = (s: Student) => {
+    picked.current = s.name;
+    setName(s.name);
+    setOpen(false);
+  };
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (!searching) onSearch(name, studentId);
+  };
+
+  const focusLookup = () => {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    nameRef.current?.focus({ preventScroll: true });
+  };
+
+  const features = [
+    { icon: UserRound, title: "Your personal record", text: "Contributions, payments and requirements — verified with just your name and ID.", action: focusLookup },
+    { icon: Wallet, title: "Open council finances", text: "Every peso collected and spent, published for all students to see.", action: onViewTransparency },
+    { icon: ReceiptText, title: "Verified receipts", text: "Official receipts and reports attached to each transaction.", action: onViewTransparency },
+    { icon: CalendarCheck, title: "Attendance history", text: "QR check-ins for every council event, recorded as they happen.", action: focusLookup },
+  ];
 
   return (
     <>
-      <section
-        ref={sectionRef}
-        className="min-h-screen w-full gradient-bg-orange relative overflow-hidden"
-      >
-        {/* Subtle orb overlays for depth */}
-        <div className="absolute inset-0 pointer-events-none">
-          <div
-            className="absolute top-16 left-10 w-80 h-80 rounded-full blur-3xl"
-            style={{ background: "rgba(110,140,255,0.18)" }}
-          />
-          <div
-            className="absolute bottom-20 right-10 w-[28rem] h-[28rem] rounded-full blur-3xl"
-            style={{ background: "rgba(14,26,77,0.35)" }}
-          />
-          {/* Watermark seal */}
-          <div
-            className="absolute right-0 top-1/2 -translate-y-1/2 w-96 h-96 opacity-[0.06]"
-            style={{
-              backgroundImage: "url(/lsc-logo.jpg)",
-              backgroundSize: "contain",
-              backgroundRepeat: "no-repeat",
-              backgroundPosition: "center",
-            }}
-          />
-        </div>
+      <section ref={heroRef} className="hero-bg blend-bottom flex min-h-[100svh] flex-col items-center px-4 pt-32 sm:px-6 lg:pt-40">
+        <div className="mx-auto w-full max-w-4xl text-center">
+          <span className="hero-intro eyebrow">
+            <ShieldCheck className="h-3.5 w-3.5 text-powder" />
+            LSC Student Digital Board · Transparency you can check
+          </span>
+          <SplitText by="chars" delay={0.1} className="mt-6 text-[2.5rem] font-extrabold leading-[1.05] text-white sm:text-6xl lg:text-7xl">
+            Your Council Records,
+            <br />
+            Clear &amp; <span className="text-brand-400">Transparent</span>
+          </SplitText>
+          <p className="hero-intro mx-auto mt-5 max-w-xl text-base text-white/65 sm:text-lg">
+            Check your contributions and attendance, and see exactly how student funds are used — all in one place.
+          </p>
 
-        {/* Content */}
-        <div className="relative z-10 min-h-screen flex items-center justify-center px-4 sm:px-6 lg:px-8 py-24">
-          <div className="w-full max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-16 items-center">
-            {/* Left Column - Headline */}
-            <div ref={headlineRef} className="text-center lg:text-left">
-              {/* Eyebrow */}
-              <span className="eyebrow block mb-4">
-                One Step Better Than Yesterday.
-              </span>
-
-              <h1
-                className="font-display font-extrabold text-4xl sm:text-5xl lg:text-6xl text-theme-heading leading-[1.05] mb-6"
-                style={{ letterSpacing: "0.02em" }}
-              >
-                <span className="word inline-block">Digital</span>{" "}
-                <span className="word inline-block">Transparency</span>{" "}
-                <span
-                  className="word inline-block"
-                  style={{ color: "var(--dssc-gold)" }}
-                >
-                  Board
-                </span>
-              </h1>
-              <p className="text-text-secondary text-lg sm:text-xl max-w-xl mx-auto lg:mx-0 mb-8 leading-relaxed">
-                Track your contributions, attendance, and council finances in
-                real-time. Transparency for a stronger student community.
-              </p>
-              <div className="flex flex-wrap justify-center lg:justify-start gap-3">
-                <button onClick={onViewTransparency} className="btn-primary px-6 py-3">
-                  <Eye className="w-5 h-5" />
-                  <span>View transparency board</span>
-                </button>
-                <a href="#lsc-preview" className="glass-button px-6 py-3">
-                  Meet the council
-                </a>
-              </div>
-              <div className="mt-10 flex flex-wrap justify-center lg:justify-start gap-x-8 gap-y-4 border-t border-border pt-6">
-                <div>
-                  <strong className="block font-display text-2xl text-theme-heading">01</strong>
-                  <span className="text-xs uppercase tracking-wider text-text-secondary">Secure access</span>
-                </div>
-                <div>
-                  <strong className="block font-display text-2xl text-theme-heading">24/7</strong>
-                  <span className="text-xs uppercase tracking-wider text-text-secondary">Always available</span>
-                </div>
-                <div>
-                  <strong className="block font-display text-2xl text-theme-heading">LIVE</strong>
-                  <span className="text-xs uppercase tracking-wider text-text-secondary">Council updates</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Right Column - Search Card */}
-            <div ref={cardRef} className="glass-card-strong p-6 sm:p-8">
-              {/* Card accent bar */}
-              <div
-                className="h-1 w-16 rounded-full mb-5"
-                style={{ background: "var(--dssc-gold)" }}
-              />
-              <h2 className="font-display font-bold text-2xl mb-2 text-theme-heading">
-                Find Your Records
-              </h2>
-              <p className="text-text-secondary mb-6 text-sm">
-                Enter your student name and Student ID to verify your identity
-                and view your contributions and attendance.
-              </p>
-
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <div className="relative">
-                  <label className="block text-sm font-medium mb-1.5 text-text-primary">
-                    Student Name
-                  </label>
-
-                  <input
-                    type="text"
-                    value={name}
-                    onChange={(e) => handleNameChange(e.target.value)}
-                    onFocus={() => {
-                      if (studentMatches.length > 0) {
-                        setShowSuggestions(true);
-                      }
-                    }}
-                    onBlur={() => {
-                      setTimeout(() => setShowSuggestions(false), 150);
-                    }}
-                    className="glass-input w-full px-4 py-3"
-                    placeholder="e.g., Juan Dela Cruz"
-                    disabled={searching}
-                    autoComplete="off"
-                  />
-
-                  {showSuggestions && (
-                    <div className="absolute left-0 right-0 top-full mt-2 z-50">
-                      <div className="rounded-xl border border-border bg-popover shadow-2xl overflow-hidden">
-                        {searchLoading && (
-                        <div className="px-4 py-3 text-sm text-text-secondary flex items-center gap-2">
-                            <Skeleton className="h-4 w-4 rounded-full" />
-                            Searching students...
-                          </div>
-                        )}
-
-                        {!searchLoading && studentMatches.length > 0 && (
-                          <div>
-                            {studentMatches.map((student) => (
-                              <button
-                                key={student.id}
-                                type="button"
-                                onMouseDown={(e) => {
-                                  e.preventDefault();
-
-                                  setName(student.name);
-                                  setShowSuggestions(false);
-                                  setStudentMatches([]);
-                                }}
-                                className="w-full text-left px-4 py-3 hover:bg-accent/30 transition-colors border-b last:border-b-0 border-border"
-                              >
-                                <div className="font-semibold text-text-primary">
-                                  {student.name}
-                                </div>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-
-                        {!searchLoading &&
-                          studentMatches.length === 0 &&
-                          name.trim() && (
-                            <div className="px-4 py-3 text-sm text-text-secondary">
-                              No students found.
-                            </div>
-                          )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium mb-1.5 text-text-primary">
-                    Student ID (verification)
-                  </label>
-                  <input
-                    type="password"
-                    value={studentId}
-                    onChange={(e) => setStudentId(e.target.value)}
-                    className="glass-input w-full px-4 py-3"
-                    placeholder="Enter your Student ID"
-                    disabled={searching}
-                    autoComplete="current-password"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full btn-primary px-6 py-3 justify-center"
-                  disabled={searching || !name.trim() || !studentId.trim()}
-                >
-                  {searching ? (
-                    <>
-                      <Skeleton className="h-5 w-5 rounded-full bg-primary/30" />
-                      Searching...
-                    </>
+          {/* Student lookup */}
+          <form onSubmit={submit} className="hero-intro card mx-auto mt-10 grid max-w-3xl gap-1 p-2 text-left shadow-lift sm:grid-cols-[1fr_1fr_auto] sm:items-center sm:rounded-full">
+            <div className="relative">
+              <Segment id="lookup-name" label="Student name">
+                <input
+                  ref={nameRef}
+                  id="lookup-name"
+                  value={name}
+                  onChange={(e) => changeName(e.target.value)}
+                  onFocus={() => setOpen(!!name.trim() && name !== picked.current)}
+                  onBlur={() => setOpen(false)}
+                  placeholder="e.g. Juan Dela Cruz"
+                  disabled={searching}
+                  autoComplete="off"
+                  className="w-full bg-transparent text-sm font-medium text-ink outline-none placeholder:text-muted/70"
+                />
+              </Segment>
+              {open && (
+                <div className="card absolute inset-x-0 top-full z-20 mt-2 overflow-hidden p-1.5 shadow-lift">
+                  {loading ? (
+                    <p className="flex items-center gap-2 px-3 py-2.5 text-sm text-muted">
+                      <Loader2 className="h-4 w-4 animate-spin" /> Searching students…
+                    </p>
+                  ) : matches.length ? (
+                    matches.map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault(); // keep focus so blur doesn't close before the pick
+                          pick(s);
+                        }}
+                        className="block w-full rounded-xl px-3 py-2.5 text-left text-sm font-semibold text-ink hover:bg-surface-2"
+                      >
+                        {s.name}
+                      </button>
+                    ))
                   ) : (
-                    <>
-                      <Search className="w-5 h-5" />
-                      Search Records
-                    </>
+                    <p className="px-3 py-2.5 text-sm text-muted">No students found.</p>
                   )}
-                </button>
-              </form>
+                </div>
+              )}
             </div>
+            <Segment id="lookup-id" label="Student ID" divided>
+              <input
+                id="lookup-id"
+                type="password"
+                value={studentId}
+                onChange={(e) => setStudentId(e.target.value)}
+                placeholder="For verification"
+                disabled={searching}
+                autoComplete="off"
+                className="w-full bg-transparent text-sm font-medium text-ink outline-none placeholder:text-muted/70"
+              />
+            </Segment>
+            <button type="submit" disabled={searching} className="btn btn-primary btn-lg mt-1 sm:mt-0">
+              {searching ? "Checking…" : "View My Record"}
+              <span className="btn-orb">{searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}</span>
+            </button>
+          </form>
+
+          <div className="mt-5 flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-sm">
+            <button onClick={onViewTransparency} className="inline-flex items-center gap-2 font-semibold text-white/85 underline-offset-4 hover:text-white hover:underline">
+              <Eye className="h-4 w-4" /> View Transparency Board
+            </button>
+            <span className="text-white/45">Your Student ID is only used to verify it&apos;s you.</span>
           </div>
         </div>
 
-        {/* Scroll Hint */}
-        <div
-          ref={scrollHintRef}
-          className="absolute bottom-8 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 text-text-secondary"
-        >
-          <span className="text-xs tracking-widest uppercase">Scroll down</span>
-          <ChevronDown className="w-5 h-5 animate-bounce" />
+        {/* Decorative preview cards */}
+        <div aria-hidden className="hero-cards pointer-events-none -mb-10 mt-auto hidden w-full max-w-5xl grid-cols-3 items-end gap-6 pt-16 md:grid">
+          <Floating tilt="-rotate-6" delay="">
+            <div className="glass p-5">
+              <p className="text-xs font-semibold text-white/60">Funds Collected</p>
+              <p className="mt-1 text-2xl font-extrabold">₱48,250</p>
+              <div className="mt-4 flex h-14 items-end gap-1.5">
+                {[40, 65, 50, 85, 60, 95, 75].map((h, i) => (
+                  <span key={i} className="flex-1 rounded-full bg-gradient-to-t from-brand-500 to-powder" style={{ height: `${h}%` }} />
+                ))}
+              </div>
+            </div>
+          </Floating>
+          <Floating tilt="rotate-0" delay="[animation-delay:-2s]">
+            <div className="card p-5 pb-16">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold text-muted">Attendance</p>
+                <span className="chip chip-success">+4%</span>
+              </div>
+              <p className="mt-1 text-3xl font-extrabold text-ink">92%</p>
+              <div className="mt-4 h-2 rounded-full bg-surface-2">
+                <div className="h-full w-[92%] rounded-full bg-gradient-to-r from-brand-500 to-indigo-500" />
+              </div>
+              <p className="mt-3 text-xs text-muted">Across 12 council events</p>
+            </div>
+          </Floating>
+          <Floating tilt="rotate-6" delay="[animation-delay:-4s]">
+            <div className="glass space-y-3 p-5">
+              <p className="text-xs font-semibold text-white/60">Receipts verified</p>
+              {["Sports fest supplies", "Org fair booth", "Seminar snacks"].map((r) => (
+                <p key={r} className="flex items-center gap-2 text-sm font-medium">
+                  <BadgeCheck className="h-4 w-4 shrink-0 text-powder" /> {r}
+                </p>
+              ))}
+            </div>
+          </Floating>
         </div>
       </section>
-      <section
-        id="lsc-preview"
-        className="relative overflow-hidden bg-[#0E1A4D] px-4 py-20 sm:px-6 lg:px-8"
-      >
-        <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_center,rgba(58,95,224,0.32),transparent_62%)]" />
-        <div className="relative z-10 mx-auto w-full max-w-6xl">
-          <div className="mb-10 text-center">
+
+      {/* Features */}
+      <section className="bg-page px-4 py-20 sm:px-6 lg:py-28">
+        <div className="mx-auto max-w-6xl">
+          <Reveal className="mx-auto max-w-2xl text-center">
             <span className="eyebrow">
-              Leadership • Service • Commitment
+              <FileCheck2 className="h-3.5 w-3.5" /> Why LSynC
             </span>
-            <h2 className="mt-3 font-display text-3xl font-bold text-white sm:text-4xl">
-              LSC Preview
-            </h2>
-            <p className="mx-auto mt-3 max-w-2xl text-sm leading-relaxed text-slate-300 sm:text-base">
-              Meet the officers dedicated to serving the Local Student Council
-              community.
-            </p>
+            <h2 className="mt-4 text-3xl font-extrabold sm:text-5xl">Everything about your council, in one honest place</h2>
+            <p className="mt-4 text-muted">Built so every student can check the numbers — no requests, no waiting.</p>
+          </Reveal>
+          <Reveal stagger className="mt-14 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+            {features.map(({ icon: Icon, title, text, action }, i) => (
+              <button
+                key={title}
+                onClick={action}
+                className={cn("group flex flex-col p-6 text-left", i === 0 ? "card-brand card-hover" : "card card-hover")}
+              >
+                <span className={cn("icon-tile", i === 0 && "border-white/25 bg-white/10 text-white")}>
+                  <Icon className="h-5 w-5" />
+                </span>
+                <h3 className={cn("mt-8 text-lg font-bold", i === 0 && "text-white")}>{title}</h3>
+                <p className={cn("mt-2 flex-1 text-sm", i === 0 ? "text-white/75" : "text-muted")}>{text}</p>
+                <span className={cn("mt-6 inline-flex items-center gap-1.5 text-sm font-semibold", i === 0 ? "text-white" : "text-brand-600")}>
+                  Learn more <ArrowRight className="h-4 w-4" />
+                </span>
+              </button>
+            ))}
+          </Reveal>
+        </div>
+      </section>
+
+      <FacebookFeed />
+
+      {/* Council officers */}
+      <section className="bg-page px-4 pb-20 sm:px-6 lg:pb-28">
+        <Reveal className="hero-bg mx-auto max-w-6xl rounded-4xl px-4 py-14 sm:px-8">
+          <div className="mb-10 text-center">
+            <span className="eyebrow">Leadership · Service · Commitment</span>
+            <h2 className="mt-4 text-3xl font-extrabold text-white sm:text-4xl">Meet your council</h2>
+            <p className="mx-auto mt-3 max-w-xl text-white/65">The officers serving the Local Student Council community.</p>
           </div>
           <LSCOfficerCarousel />
-        </div>
+        </Reveal>
       </section>
     </>
+  );
+}
+
+function Segment({ id, label, divided, children }: { id: string; label: string; divided?: boolean; children: ReactNode }) {
+  return (
+    <div className={cn("rounded-2xl px-5 py-2.5 transition focus-within:bg-surface-2 sm:rounded-full", divided && "sm:rounded-none sm:border-l sm:border-line sm:focus-within:rounded-full")}>
+      <label htmlFor={id} className="block text-[11px] font-bold uppercase tracking-wider text-ink">
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+/** Rotation lives on the wrapper because `animate-float` owns the transform. */
+function Floating({ tilt, delay, children }: { tilt: string; delay: string; children: ReactNode }) {
+  return (
+    <div className={cn("hero-card", tilt)}>
+      <div className={cn("animate-float", delay)}>{children}</div>
+    </div>
   );
 }

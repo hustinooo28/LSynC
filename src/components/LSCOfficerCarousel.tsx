@@ -1,107 +1,82 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { useEffect, useState } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+import { cn } from "@/lib/utils";
 
-const OFFICER_IMAGES = Array.from({ length: 18 }, (_, index) => `/${index + 1}.jpg`);
+const IMAGES = Array.from({ length: 18 }, (_, i) => `/${i + 1}.jpg`);
+const N = IMAGES.length;
 
+/** 3D cover-flow of officer photos; auto-advances unless hovered/focused. */
 export default function LSCOfficerCarousel() {
   const [active, setActive] = useState(0);
-  const [isPaused, setIsPaused] = useState(false);
-
-  const move = useCallback((direction: number) => {
-    setActive((current) => (current + direction + OFFICER_IMAGES.length) % OFFICER_IMAGES.length);
-  }, []);
+  const [paused, setPaused] = useState(false);
+  const move = (dir: number) => setActive((a) => (a + dir + N) % N);
 
   useEffect(() => {
-    if (isPaused) return;
-    const interval = window.setInterval(() => move(1), 4500);
-    return () => window.clearInterval(interval);
-  }, [isPaused, move]);
+    if (paused) return;
+    const id = setInterval(() => setActive((a) => (a + 1) % N), 4500);
+    return () => clearInterval(id);
+  }, [paused]);
 
-  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === 'ArrowLeft') move(-1);
-    if (event.key === 'ArrowRight') move(1);
-  };
+  const arrow = "btn btn-icon absolute top-1/2 z-20 -translate-y-1/2 border border-white/25 bg-white/10 text-white backdrop-blur hover:bg-white/20";
 
   return (
     <div
-      className="relative w-full outline-none"
       tabIndex={0}
       role="region"
-      aria-label="LSC Officers carousel"
-      onKeyDown={handleKeyDown}
-      onMouseEnter={() => setIsPaused(true)}
-      onMouseLeave={() => setIsPaused(false)}
-      onFocus={() => setIsPaused(true)}
-      onBlur={() => setIsPaused(false)}
+      aria-label="LSC officers carousel"
+      className="relative w-full outline-none"
+      onKeyDown={(e) => (e.key === "ArrowLeft" ? move(-1) : e.key === "ArrowRight" && move(1))}
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+      onFocus={() => setPaused(true)}
+      onBlur={() => setPaused(false)}
     >
       <div className="relative mx-auto h-[min(72vw,27rem)] min-h-[20rem] w-full max-w-5xl [perspective:1400px]">
-        {OFFICER_IMAGES.map((src, index) => {
-          let relative = index - active;
-          if (relative > OFFICER_IMAGES.length / 2) relative -= OFFICER_IMAGES.length;
-          if (relative < -OFFICER_IMAGES.length / 2) relative += OFFICER_IMAGES.length;
-
-          const distance = Math.abs(relative);
-          const visible = distance <= 2;
-          const isActive = relative === 0;
-
+        {IMAGES.map((src, i) => {
+          // Shortest signed distance from the active slide, wrapping around.
+          const rel = ((i - active + N + N / 2) % N) - N / 2;
+          const dist = Math.abs(rel);
+          const visible = dist <= 2;
           return (
             <button
               key={src}
               type="button"
-              aria-label={`Show officer image ${index + 1}`}
+              aria-label={`Show officer image ${i + 1}`}
               aria-hidden={!visible}
               tabIndex={visible ? 0 : -1}
-              onClick={() => setActive(index)}
-              className="absolute left-1/2 top-1/2 overflow-hidden rounded-2xl border-2 border-white/50 bg-[#0E1A4D] shadow-2xl transition-[transform,opacity] duration-700 ease-out"
+              onClick={() => setActive(i)}
+              className="absolute left-1/2 top-1/2 h-[clamp(17rem,48vw,25rem)] w-[clamp(13rem,32vw,20rem)] overflow-hidden rounded-3xl border border-white/30 bg-brand-950 shadow-lift transition-[transform,opacity] duration-700 ease-out"
               style={{
-                width: 'clamp(13rem, 32vw, 20rem)',
-                height: 'clamp(17rem, 48vw, 25rem)',
-                opacity: visible ? (isActive ? 1 : 0.62) : 0,
-                pointerEvents: visible ? 'auto' : 'none',
-                transform: `translate(-50%, -50%) translateX(${relative * 38}%) translateZ(${-distance * 180}px) rotateY(${-relative * 22}deg) scale(${Math.max(0.68, 1 - distance * 0.13)})`,
-                zIndex: 10 - distance,
+                opacity: visible ? (rel === 0 ? 1 : 0.6) : 0,
+                pointerEvents: visible ? "auto" : "none",
+                transform: `translate(-50%, -50%) translateX(${rel * 38}%) translateZ(${-dist * 180}px) rotateY(${-rel * 22}deg) scale(${Math.max(0.68, 1 - dist * 0.13)})`,
+                zIndex: 10 - dist,
               }}
             >
-              <img
-                src={src}
-                alt={`LSC officer ${index + 1}`}
-                draggable={false}
-                className="h-full w-full object-contain"
-              />
-              <span className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#0E1A4D]/80 to-transparent p-3 text-right text-xs font-semibold text-white">
-                {index + 1} / {OFFICER_IMAGES.length}
+              <img src={src} alt={`LSC officer ${i + 1}`} draggable={false} className="h-full w-full object-contain" />
+              <span className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-brand-950/80 to-transparent p-3 text-right text-xs font-semibold text-white">
+                {i + 1} / {N}
               </span>
             </button>
           );
         })}
-
-        <button
-          type="button"
-          onClick={() => move(-1)}
-          aria-label="Previous officer"
-          className="absolute left-2 top-1/2 z-20 -translate-y-1/2 rounded-full border border-white/50 bg-[#0E1A4D]/80 p-2 text-white shadow-lg transition hover:bg-[#1B2E8C] sm:left-6 sm:p-3"
-        >
-          <ChevronLeft className="h-5 w-5 sm:h-6 sm:w-6" />
+        <button type="button" onClick={() => move(-1)} aria-label="Previous officer" className={cn(arrow, "left-1 sm:left-4")}>
+          <ChevronLeft className="h-5 w-5" />
         </button>
-        <button
-          type="button"
-          onClick={() => move(1)}
-          aria-label="Next officer"
-          className="absolute right-2 top-1/2 z-20 -translate-y-1/2 rounded-full border border-white/50 bg-[#0E1A4D]/80 p-2 text-white shadow-lg transition hover:bg-[#1B2E8C] sm:right-6 sm:p-3"
-        >
-          <ChevronRight className="h-5 w-5 sm:h-6 sm:w-6" />
+        <button type="button" onClick={() => move(1)} aria-label="Next officer" className={cn(arrow, "right-1 sm:right-4")}>
+          <ChevronRight className="h-5 w-5" />
         </button>
       </div>
 
-      <div className="mt-5 flex flex-wrap justify-center gap-2" aria-label="Choose officer image">
-        {OFFICER_IMAGES.map((src, index) => (
+      <div className="mt-6 flex flex-wrap justify-center gap-2">
+        {IMAGES.map((src, i) => (
           <button
-            key={`indicator-${src}`}
+            key={src}
             type="button"
-            onClick={() => setActive(index)}
-            aria-label={`Go to officer image ${index + 1}`}
-            aria-current={active === index ? 'true' : undefined}
-            className={`h-2.5 rounded-full transition-all ${active === index ? 'w-7 bg-lsc-gold' : 'w-2.5 bg-white/50 hover:bg-white/80'}`}
+            onClick={() => setActive(i)}
+            aria-label={`Go to officer image ${i + 1}`}
+            aria-current={active === i || undefined}
+            className={cn("h-2 rounded-full transition-all", active === i ? "w-7 bg-powder" : "w-2 bg-white/40 hover:bg-white/70")}
           />
         ))}
       </div>

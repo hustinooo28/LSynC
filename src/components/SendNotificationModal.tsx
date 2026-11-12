@@ -1,11 +1,8 @@
 import { useState } from "react";
+import { BellRing } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import Modal from "@/components/ui/Modal";
+import Field from "@/components/ui/Field";
 import { studentsService } from "@/services/db";
 import { notificationsService } from "@/services/notificationsService";
 
@@ -14,57 +11,33 @@ interface SendNotificationModalProps {
   onOpenChange: (open: boolean) => void;
 }
 
-type RecipientOption = "all_students" | "all_officers" | "student";
+type Recipient = "all_students" | "all_officers" | "student";
+const EMPTY = { recipient: "all_students" as Recipient, studentId: "", title: "", body: "" };
 
 /** Staff-only compose modal — the INSERT is also gated server-side by public.is_staff(). */
 export default function SendNotificationModal({ open, onOpenChange }: SendNotificationModalProps) {
-  const [recipient, setRecipient] = useState<RecipientOption>("all_students");
-  const [studentIdInput, setStudentIdInput] = useState("");
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const [form, setForm] = useState(EMPTY);
   const [sending, setSending] = useState(false);
-
-  function reset() {
-    setRecipient("all_students");
-    setStudentIdInput("");
-    setTitle("");
-    setBody("");
-  }
+  const set = (patch: Partial<typeof EMPTY>) => setForm((f) => ({ ...f, ...patch }));
 
   async function handleSend() {
-    if (!title.trim() || !body.trim()) {
-      toast.error("Please fill in both a title and a message.");
-      return;
-    }
+    const title = form.title.trim();
+    const body = form.body.trim();
+    const studentId = form.studentId.trim();
+    if (!title || !body) return void toast.error("Please fill in both a title and a message.");
+    if (form.recipient === "student" && !studentId) return void toast.error("Enter the student's Student ID.");
 
-    if (recipient === "student" && !studentIdInput.trim()) {
-      toast.error("Enter the student's Student ID.");
-      return;
-    }
-
+    setSending(true);
     try {
-      setSending(true);
-
       let recipientStudentId: string | undefined;
-
-      if (recipient === "student") {
-        const student = await studentsService.getByStudentId(studentIdInput.trim());
-        if (!student) {
-          toast.error("No student found with that Student ID.");
-          return;
-        }
+      if (form.recipient === "student") {
+        const student = await studentsService.getByStudentId(studentId);
+        if (!student) return void toast.error("No student found with that Student ID.");
         recipientStudentId = student.id;
       }
-
-      await notificationsService.sendAnnouncement({
-        recipientKind: recipient,
-        recipientStudentId,
-        title: title.trim(),
-        body: body.trim(),
-      });
-
+      await notificationsService.sendAnnouncement({ recipientKind: form.recipient, recipientStudentId, title, body });
       toast.success("Notification sent.");
-      reset();
+      setForm(EMPTY);
       onOpenChange(false);
     } catch (error) {
       console.error("Failed to send notification:", error);
@@ -75,81 +48,57 @@ export default function SendNotificationModal({ open, onOpenChange }: SendNotifi
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="glass-card-strong w-[calc(100%-2rem)] max-w-md">
-        <DialogHeader>
-          <DialogTitle className="font-display font-bold text-xl text-dark">
-            Send Notification
-          </DialogTitle>
-        </DialogHeader>
-
-        <div className="space-y-4 mt-2">
-          <div>
-            <label className="block text-sm font-medium text-dark mb-1.5">Send to</label>
-            <select
-              value={recipient}
-              onChange={(e) => setRecipient(e.target.value as RecipientOption)}
-              className="glass-input w-full px-4 py-2"
-            >
-              <option value="all_students">All students</option>
-              <option value="all_officers">All officers</option>
-              <option value="student">A specific student</option>
-            </select>
-          </div>
-
-          {recipient === "student" && (
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1">Student ID</label>
-              <input
-                type="text"
-                value={studentIdInput}
-                onChange={(e) => setStudentIdInput(e.target.value)}
-                className="glass-input w-full px-4 py-2"
-                placeholder="e.g., 2023-00123"
-              />
-            </div>
-          )}
-
-          <div>
-            <label className="block text-sm font-medium text-dark mb-1">Title</label>
+    <Modal
+      open={open}
+      onClose={() => onOpenChange(false)}
+      title="Send Notification"
+      icon={<BellRing className="h-5 w-5 text-brand-500" />}
+      footer={
+        <>
+          <button className="btn btn-secondary" onClick={() => onOpenChange(false)} disabled={sending}>
+            Cancel
+          </button>
+          <button className="btn btn-primary" onClick={handleSend} disabled={sending}>
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <Field label="Send to">
+          <select className="input" value={form.recipient} onChange={(e) => set({ recipient: e.target.value as Recipient })}>
+            <option value="all_students">All students</option>
+            <option value="all_officers">All officers</option>
+            <option value="student">A specific student</option>
+          </select>
+        </Field>
+        {form.recipient === "student" && (
+          <Field label="Student ID">
             <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              className="glass-input w-full px-4 py-2"
-              placeholder="e.g., General Assembly rescheduled"
+              className="input"
+              value={form.studentId}
+              onChange={(e) => set({ studentId: e.target.value })}
+              placeholder="e.g., 2023-00123"
             />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-dark mb-1">Message</label>
-            <textarea
-              value={body}
-              onChange={(e) => setBody(e.target.value)}
-              className="glass-input w-full px-4 py-2 min-h-[90px]"
-              placeholder="Write the notification message..."
-            />
-          </div>
-
-          <div className="flex gap-3 pt-2">
-            <button
-              onClick={() => onOpenChange(false)}
-              className="flex-1 glass-button px-4 py-2.5"
-              disabled={sending}
-            >
-              Cancel
-            </button>
-
-            <button
-              onClick={handleSend}
-              className="flex-1 btn-primary px-4 py-2.5"
-              disabled={sending}
-            >
-              {sending ? "Sending..." : "Send"}
-            </button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+          </Field>
+        )}
+        <Field label="Title">
+          <input
+            className="input"
+            value={form.title}
+            onChange={(e) => set({ title: e.target.value })}
+            placeholder="e.g., General Assembly rescheduled"
+          />
+        </Field>
+        <Field label="Message">
+          <textarea
+            className="input"
+            value={form.body}
+            onChange={(e) => set({ body: e.target.value })}
+            placeholder="Write the notification message..."
+          />
+        </Field>
+      </div>
+    </Modal>
   );
 }

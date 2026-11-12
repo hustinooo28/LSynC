@@ -1,20 +1,10 @@
-// ======================================================================
-// Student QR codes — auto-generated for attendance tracking
-// ======================================================================
-// Every student gets a QR code that encodes their Student ID, Name,
-// Program, Year, and Section as a small JSON payload. Staff scan these
-// QR codes at events (see the Event Management attendance tab) to mark
-// attendance; students can download their own QR from the Student
-// Management table or from their public student-record page.
-//
-// Uses the battle-tested "qrcode" package (MIT) — fully client-side,
-// no network calls or third-party services required.
-// ======================================================================
+// Student QR codes for attendance: the QR encodes a small JSON payload
+// (ID, name, program, year, section) that the attendance scanner parses.
+// `qrcode` is loaded on demand so the scanner page doesn't pay for it.
 
-import QRCode from "qrcode";
 import type { Student } from "@/types";
 
-export interface StudentQrPayload {
+interface StudentQrPayload {
   /** Version marker so the scanner can reject old / foreign payloads. */
   version: 1;
   kind: "student";
@@ -25,9 +15,8 @@ export interface StudentQrPayload {
   section: string;
 }
 
-/** Builds the JSON payload encoded inside a student's QR code. */
-export function studentQrPayload(student: Student): StudentQrPayload {
-  return {
+const studentQrText = (student: Student): string =>
+  JSON.stringify({
     version: 1,
     kind: "student",
     studentId: student.studentId,
@@ -35,32 +24,20 @@ export function studentQrPayload(student: Student): StudentQrPayload {
     program: student.program,
     year: student.yearLevel,
     section: student.section,
-  };
-}
-
-/** The text encoded in the QR (JSON containing the 5 required fields). */
-export function studentQrText(student: Student): string {
-  return JSON.stringify(studentQrPayload(student));
-}
+  } satisfies StudentQrPayload);
 
 /** Tries to parse raw scanner / pasted text back into a student payload. */
 export function parseStudentQrText(text: string): StudentQrPayload | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
   try {
-    const value = JSON.parse(trimmed);
-    if (
-      value &&
-      value.version === 1 &&
+    const value = JSON.parse(text.trim());
+    const valid =
+      value?.version === 1 &&
       value.kind === "student" &&
       typeof value.studentId === "string" &&
-      value.studentId &&
+      !!value.studentId &&
       typeof value.name === "string" &&
-      value.name
-    ) {
-      return value as StudentQrPayload;
-    }
-    return null;
+      !!value.name;
+    return valid ? (value as StudentQrPayload) : null;
   } catch {
     return null;
   }
@@ -122,6 +99,7 @@ function attendancePassFileName(student: Student, ext: "png" | "svg"): string {
 
 /** Builds the formal, self-contained SVG used for both attendance-pass exports. */
 export async function studentAttendancePassSvg(student: Student): Promise<string> {
+  const { default: QRCode } = await import("qrcode");
   const [qrDataUri, lscLogo] = await Promise.all([
     // Rasterize the QR to a PNG data URI (not a nested SVG) before embedding it
     // in the pass. Browsers block nested `<image>` SVG data-URIs when an SVG is
@@ -250,7 +228,7 @@ export async function downloadStudentAttendancePass(student: Student, format: "p
 }
 
 /** Triggers a browser download for the given href (data: or blob:). */
-export function downloadUrl(href: string, fileName: string): void {
+function downloadUrl(href: string, fileName: string): void {
   const link = document.createElement("a");
   link.href = href;
   link.download = fileName;

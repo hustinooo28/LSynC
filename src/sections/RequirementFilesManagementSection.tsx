@@ -1,38 +1,20 @@
-import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
-import {
-  Plus,
-  Edit2,
-  Trash2,
-  UploadCloud,
-  FileText,
-  Eye,
-  EyeOff,
-  RefreshCcw,
-  FolderOpen,
-  Users,
-  Lock,
-  Clock,
-  Download,
-} from "lucide-react";
-import SectionLoader from "@/components/SectionLoader";
-import Skeleton from "@/components/Skeleton";
-import SectionEmptyState from "@/components/SectionEmptyState";
-import SectionLayout from "@/components/common/SectionLayout";
-import ConfirmDialog from "@/components/common/ConfirmDialog";
-import SearchFilterBar from "@/components/common/SearchFilterBar";
-import FilePreview from "@/components/FilePreview";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { useEffect, useState } from "react";
+import { Clock, Download, Edit2, Eye, EyeOff, FileText, FolderOpen, Globe, Lock, Plus, Trash2, UploadCloud, Users } from "lucide-react";
+import { toast } from "sonner";
 import { studentRequirementFilesService, studentsService } from "@/services/db";
 import type { Student, StudentRequirementFile, UserRole } from "@/types";
 import { formatDate } from "@/lib/format";
 import { useSearch } from "@/hooks/useSearch";
-import { toast } from "sonner";
+import { FilePreviewModal, FileSize } from "@/components/FilePreview";
+import Page from "@/components/ui/Page";
+import Modal from "@/components/ui/Modal";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import Field from "@/components/ui/Field";
+import SearchInput from "@/components/ui/SearchInput";
+import StatCard from "@/components/ui/StatCard";
+import EmptyState from "@/components/ui/EmptyState";
+import Skeleton, { LoadingCard } from "@/components/ui/Skeleton";
+import { Menu, MenuContent, MenuItem, MenuSeparator, RowActionsTrigger } from "@/components/ui/Menu";
 
 interface RequirementFilesManagementSectionProps {
   onBack: () => void;
@@ -40,207 +22,103 @@ interface RequirementFilesManagementSectionProps {
   userId?: string;
 }
 
-/** Formats a byte count into a human-readable file size (e.g. "1.4 MB"). */
-function formatFileSize(bytes?: number): string {
-  if (!bytes) return "—";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = bytes;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
+const ACCEPT = "application/pdf,image/*,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,audio/*,video/*";
+const studentText = (s: Student) => `${s.name} ${s.studentId}`;
 
-type ModalMode =
-  | { type: "create" }
-  | { type: "edit"; file: StudentRequirementFile };
+/** null = closed, "new" = upload, otherwise the file being edited/replaced. */
+type EditTarget = StudentRequirementFile | "new" | null;
 
-export default function RequirementFilesManagementSection({
-  onBack,
-  role,
-  userId = "",
-}: RequirementFilesManagementSectionProps) {
+export default function RequirementFilesManagementSection({ onBack, role, userId = "" }: RequirementFilesManagementSectionProps) {
+  const allowed = role === "admin" || role === "secretary";
   const [files, setFiles] = useState<StudentRequirementFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // Upload modal state
-  const [modal, setModal] = useState<ModalMode | null>(null);
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [publish, setPublish] = useState(true);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [editing, setEditing] = useState<EditTarget>(null);
+  const [form, setForm] = useState({ title: "", description: "", publish: true });
+  const [pickedFile, setPickedFile] = useState<File | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<StudentRequirementFile | null>(null);
+  const [previewFile, setPreviewFile] = useState<StudentRequirementFile | null>(null);
 
-  // Replace-file modal state
-  const [replaceTarget, setReplaceTarget] =
-    useState<StudentRequirementFile | null>(null);
-  const [replaceFile, setReplaceFile] = useState<File | null>(null);
-  const replaceInputRef = useRef<HTMLInputElement>(null);
-
-  // Delete confirm state
-  const [deleteTarget, setDeleteTarget] =
-    useState<StudentRequirementFile | null>(null);
-
-  // File preview modal state
-  const [previewFile, setPreviewFile] =
-    useState<StudentRequirementFile | null>(null);
-
-  // Manage Access (student-specific downloads) modal state
-  const [accessTarget, setAccessTarget] =
-    useState<StudentRequirementFile | null>(null);
-  const [accessRestricted, setAccessRestricted] = useState(false);
-  const [allStudents, setAllStudents] = useState<Student[]>([]);
+  // Manage-access dialog (student-specific downloads)
+  const [accessTarget, setAccessTarget] = useState<StudentRequirementFile | null>(null);
+  const [restricted, setRestricted] = useState(false);
+  const [students, setStudents] = useState<Student[]>([]);
   const [studentsLoading, setStudentsLoading] = useState(false);
-  const [selectedStudentIds, setSelectedStudentIds] = useState<Set<string>>(
-    new Set(),
-  );
-  const [accessSaving, setAccessSaving] = useState(false);
-  const {
-    searchTerm: studentSearch,
-    setSearchTerm: setStudentSearch,
-    filtered: filteredStudents,
-  } = useSearch<Student>({
-    items: allStudents,
-    searchKeys: ["name", "studentId"],
-  });
-
-  const loadFiles = async () => {
-    try {
-      setLoading(true);
-      const data = await studentRequirementFilesService.getAll();
-      setFiles(data);
-    } catch (error) {
-      console.error("Error loading files:", error);
-      toast.error("Failed to load files");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const studentSearch = useSearch(students, studentText);
 
   useEffect(() => {
-    loadFiles();
-  }, []);
+    if (!allowed) return;
+    studentRequirementFilesService
+      .getAll()
+      .then(setFiles)
+      .catch((error) => {
+        console.error("Error loading files:", error);
+        toast.error("Failed to load files");
+      })
+      .finally(() => setLoading(false));
+  }, [allowed]);
 
-  // Only the Admin may manage requirement files.
-  if (role !== "admin" && role !== "secretary") {
+  if (!allowed) {
     return (
-      <SectionLayout title="Council Files" onBack={onBack}>
-        <SectionEmptyState
-          message="You do not have permission to manage files."
-          icon={EyeOff}
-          card
-        />
-      </SectionLayout>
+      <Page title="Council Files" onBack={onBack}>
+        <div className="card">
+          <EmptyState icon={EyeOff} title="You do not have permission to manage files." />
+        </div>
+      </Page>
     );
   }
 
-  const openCreate = () => {
-    setTitle("");
-    setDescription("");
-    setPublish(true);
-    setSelectedFile(null);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-    setModal({ type: "create" });
+  const upsert = (file: StudentRequirementFile) => setFiles((prev) => prev.map((f) => (f.id === file.id ? file : f)));
+
+  /** Runs a save/delete with the shared spinner state; returns true on success. */
+  const run = async (action: () => Promise<void>, failure: string) => {
+    setSaving(true);
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      console.error(failure, error);
+      toast.error(`${failure} Please try again.`);
+      return false;
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const openEdit = (file: StudentRequirementFile) => {
-    setTitle(file.title);
-    setDescription(file.description ?? "");
-    setPublish(file.isPublished);
-    setSelectedFile(null);
-    if (fileInputRef.current) fileInputRef.current.value = "";
-    setModal({ type: "edit", file });
-  };
-
-  const handleFilePick = (e: ChangeEvent<HTMLInputElement>) => {
-    setSelectedFile(e.target.files?.[0] ?? null);
+  const openEditor = (file: StudentRequirementFile | "new") => {
+    setForm(file === "new" ? { title: "", description: "", publish: true } : { title: file.title, description: file.description ?? "", publish: file.isPublished });
+    setPickedFile(null);
+    setEditing(file);
   };
 
   const handleSubmit = async () => {
-    if (!title.trim()) {
-      toast.error("Please provide a title for the file.");
-      return;
-    }
-    if (modal?.type === "create" && !selectedFile) {
-      toast.error("Please choose a file to upload.");
-      return;
-    }
-    setSaving(true);
-    try {
-      if (modal?.type === "create" && selectedFile) {
-        const created = await studentRequirementFilesService.create({
-          title: title.trim(),
-          description: description.trim() || undefined,
-          file: selectedFile,
-          fileName: selectedFile.name,
-          isPublished: publish,
-          createdBy: userId,
-        });
+    const title = form.title.trim();
+    if (!title) return toast.error("Please provide a title for the file.");
+    if (editing === "new" && !pickedFile) return toast.error("Please choose a file to upload.");
+    const meta = { title, description: form.description.trim() || undefined, isPublished: form.publish };
+
+    const ok = await run(async () => {
+      if (editing === "new") {
+        const created = await studentRequirementFilesService.create({ ...meta, file: pickedFile!, fileName: pickedFile!.name, createdBy: userId });
         setFiles((prev) => [created, ...prev]);
         toast.success("File uploaded successfully.");
-      } else if (modal?.type === "edit" && modal.file) {
-        const updated = await studentRequirementFilesService.update(
-          modal.file.id,
-          {
-            title: title.trim(),
-            description: description.trim() || undefined,
-            isPublished: publish,
-          },
-        );
-        setFiles((prev) =>
-          prev.map((f) => (f.id === updated.id ? updated : f)),
-        );
-        toast.success("File updated.");
+      } else if (editing) {
+        let updated = await studentRequirementFilesService.update(editing.id, meta);
+        if (pickedFile) updated = await studentRequirementFilesService.replaceFile(editing.id, pickedFile, pickedFile.name);
+        upsert(updated);
+        toast.success(pickedFile ? "File replaced successfully." : "File updated.");
       }
-      setModal(null);
-    } catch (error) {
-      console.error("Error saving file:", error);
-      toast.error("Failed to save the file. Please try again.");
-    } finally {
-      setSaving(false);
-    }
+    }, "Failed to save the file.");
+    if (ok) setEditing(null);
   };
 
-  const handleReplacePick = (e: ChangeEvent<HTMLInputElement>) => {
-    setReplaceFile(e.target.files?.[0] ?? null);
-  };
-
-  const handleReplaceFile = async () => {
-    if (!replaceTarget || !replaceFile) return;
-    setSaving(true);
+  const togglePublish = async (file: StudentRequirementFile) => {
     try {
-      const updated = await studentRequirementFilesService.replaceFile(
-        replaceTarget.id,
-        replaceFile,
-        replaceFile.name,
-      );
-      setFiles((prev) => prev.map((f) => (f.id === updated.id ? updated : f)));
-      toast.success("File replaced successfully.");
-      setReplaceTarget(null);
-      setReplaceFile(null);
-      if (replaceInputRef.current) replaceInputRef.current.value = "";
-    } catch (error) {
-      console.error("Error replacing file:", error);
-      toast.error("Failed to replace the file. Please try again.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleTogglePublish = async (file: StudentRequirementFile) => {
-    try {
-      const updated = await studentRequirementFilesService.update(file.id, {
-        isPublished: !file.isPublished,
-      });
-      setFiles((prev) => prev.map((f) => (f.id === updated.id ? updated : f)));
-      toast.success(
-        updated.isPublished
-          ? `"${updated.title}" is now published and visible to students.`
-          : `"${updated.title}" is now hidden from students.`,
-      );
+      const updated = await studentRequirementFilesService.update(file.id, { isPublished: !file.isPublished });
+      upsert(updated);
+      toast.success(updated.isPublished ? `"${updated.title}" is now published and visible to students.` : `"${updated.title}" is now hidden from students.`);
     } catch (error) {
       console.error("Error toggling publish state:", error);
       toast.error("Failed to update publish state. Please try again.");
@@ -249,34 +127,26 @@ export default function RequirementFilesManagementSection({
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
-    setSaving(true);
-    try {
+    const ok = await run(async () => {
       await studentRequirementFilesService.delete(deleteTarget.id);
       setFiles((prev) => prev.filter((f) => f.id !== deleteTarget.id));
       toast.success("File deleted.");
-      setDeleteTarget(null);
-    } catch (error) {
-      console.error("Error deleting file:", error);
-      toast.error("Failed to delete the file. Please try again.");
-    } finally {
-      setSaving(false);
-    }
+    }, "Failed to delete the file.");
+    if (ok) setDeleteTarget(null);
   };
 
   const openAccess = async (file: StudentRequirementFile) => {
     setAccessTarget(file);
-    setAccessRestricted(file.restricted);
-    setStudentSearch("");
+    setRestricted(file.restricted);
+    studentSearch.reset();
     setStudentsLoading(true);
     try {
-      const [students, accessIds] = await Promise.all([
-        allStudents.length > 0
-          ? Promise.resolve(allStudents)
-          : studentsService.getAll(),
+      const [all, accessIds] = await Promise.all([
+        students.length ? students : studentsService.getAll(),
         studentRequirementFilesService.getAccessList(file.id),
       ]);
-      setAllStudents(students);
-      setSelectedStudentIds(new Set(accessIds));
+      setStudents(all);
+      setSelectedIds(new Set(accessIds));
     } catch (error) {
       console.error("Error loading student access list:", error);
       toast.error("Failed to load students. Please try again.");
@@ -286,212 +156,150 @@ export default function RequirementFilesManagementSection({
     }
   };
 
-  const toggleStudent = (studentId: string) => {
-    setSelectedStudentIds((prev) => {
+  const toggleStudent = (id: string) =>
+    setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(studentId)) next.delete(studentId);
-      else next.add(studentId);
+      if (!next.delete(id)) next.add(id);
       return next;
     });
-  };
 
   const handleSaveAccess = async () => {
     if (!accessTarget) return;
-    setAccessSaving(true);
-    try {
-      if (accessRestricted !== accessTarget.restricted) {
-        const updated = await studentRequirementFilesService.update(
-          accessTarget.id,
-          {
-            restricted: accessRestricted,
-          },
-        );
-        setFiles((prev) =>
-          prev.map((f) => (f.id === updated.id ? updated : f)),
-        );
-      }
-      await studentRequirementFilesService.setAccessList(
-        accessTarget.id,
-        Array.from(selectedStudentIds),
-      );
+    const ok = await run(async () => {
+      if (restricted !== accessTarget.restricted) upsert(await studentRequirementFilesService.update(accessTarget.id, { restricted }));
+      await studentRequirementFilesService.setAccessList(accessTarget.id, [...selectedIds]);
       toast.success("Student access updated.");
-      setAccessTarget(null);
-    } catch (error) {
-      console.error("Error saving student access:", error);
-      toast.error("Failed to update student access. Please try again.");
-    } finally {
-      setAccessSaving(false);
-    }
+    }, "Failed to update student access.");
+    if (ok) setAccessTarget(null);
   };
 
+  const published = files.filter((f) => f.isPublished).length;
+  const isNew = editing === "new";
+  const closeUnlessSaving = (close: () => void) => () => !saving && close();
+
   return (
-    <SectionLayout
+    <Page
+      eyebrow="Council files"
       title="Council Files"
-      subtitle="Upload and manage the documents students need (Admin only)"
+      subtitle="Upload and manage the documents students need, and control who can download them."
       onBack={onBack}
-      gradientClass="gradient-bg-orange"
-      headerActions={
-        <button
-          onClick={openCreate}
-          className="btn-primary px-4 py-2.5 flex items-center gap-2 text-sm"
-        >
-          <Plus className="w-4 h-4" />
-          Upload File
+      actions={
+        <button onClick={() => openEditor("new")} className="btn btn-primary">
+          <Plus className="h-4 w-4" /> Upload file
         </button>
+      }
+      hero={
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <StatCard featured icon={FolderOpen} label="Total files" value={files.length} />
+          <StatCard icon={Eye} tone="success" label="Published" value={published} hint={`${files.length - published} hidden`} />
+          <StatCard icon={Lock} tone="warning" label="Restricted" value={files.filter((f) => f.restricted).length} hint="Selected students only" />
+        </div>
       }
     >
       {loading ? (
-        <SectionLoader />
+        <LoadingCard />
       ) : files.length === 0 ? (
-        <SectionEmptyState
-          message="No files uploaded yet. Click “Upload File” to add the first one."
-          icon={FolderOpen}
-          card
-        />
+        <div className="card">
+          <EmptyState
+            icon={FolderOpen}
+            title="No files uploaded yet"
+            description="Upload the first document students need."
+            action={
+              <button onClick={() => openEditor("new")} className="btn btn-primary">
+                <Plus className="h-4 w-4" /> Upload file
+              </button>
+            }
+          />
+        </div>
       ) : (
-        <div className="glass-card p-5 lg:p-6">
+        <div className="card overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="glass-table">
+            <table className="data-table">
               <thead>
                 <tr>
-                  <th>Title</th>
-                  <th>Description</th>
                   <th>File</th>
                   <th>Status</th>
                   <th>Access</th>
                   <th>Updated</th>
-                  <th>Actions</th>
+                  <th className="text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {files.map((file) => (
                   <tr key={file.id}>
-                    <td className="font-medium text-dark">{file.title}</td>
-                    <td className="text-text-secondary text-sm max-w-xs">
-                      {file.description || "—"}
-                    </td>
-                    <td className="text-text-secondary text-sm">
-                      <span className="inline-flex items-center gap-1.5">
-                        <FileText className="w-4 h-4 text-red" />
-                        {file.fileName}
-                        <span className="text-xs text-text-secondary/70">
-                          ({formatFileSize(file.fileSize)})
-                        </span>
-                      </span>
+                    <td className="min-w-[16rem]">
+                      <div className="flex items-start gap-3">
+                        <div className="icon-tile h-10 w-10">
+                          <FileText className="h-5 w-5" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-semibold">{file.title}</p>
+                          {file.description && <p className="line-clamp-2 max-w-md text-xs text-muted">{file.description}</p>}
+                          <p className="mt-0.5 text-xs text-muted">
+                            {file.fileName} · <FileSize bytes={file.fileSize} />
+                          </p>
+                        </div>
+                      </div>
                     </td>
                     <td>
-                      <span
-                        className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full ${
-                          file.isPublished
-                            ? "bg-green-100 text-green-700"
-                            : "bg-gray-100 text-text-secondary"
-                        }`}
+                      <button
+                        role="switch"
+                        aria-checked={file.isPublished}
+                        onClick={() => togglePublish(file)}
+                        className={`chip ${file.isPublished ? "chip-success" : "chip-neutral"} hover:brightness-95`}
+                        title={file.isPublished ? "Unpublish (hide from students)" : "Publish (show to students)"}
                       >
-                        {file.isPublished ? (
-                          <>
-                            <Eye className="w-3.5 h-3.5" /> Published
-                          </>
-                        ) : (
-                          <>
-                            <EyeOff className="w-3.5 h-3.5" /> Hidden
-                          </>
-                        )}
-                      </span>
+                        {file.isPublished ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+                        {file.isPublished ? "Published" : "Hidden"}
+                      </button>
                     </td>
                     <td>
                       {file.restricted ? (
-                        <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full bg-amber-100 text-amber-700">
-                          <Lock className="w-3.5 h-3.5" /> Selected students
+                        <span className="chip chip-warning">
+                          <Lock className="h-3.5 w-3.5" /> Selected students
                         </span>
                       ) : (
-                        <span className="text-xs text-text-secondary">
-                          Everyone
+                        <span className="chip chip-neutral">
+                          <Globe className="h-3.5 w-3.5" /> Everyone
                         </span>
                       )}
                     </td>
-                    <td className="text-text-secondary text-sm whitespace-nowrap">
-                      {formatDate(file.updatedAt)}
-                    </td>
-                    <td>
-                      <div className="flex items-center gap-2">
-                        {file.fileUrl ? (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => setPreviewFile(file)}
-                              className="p-2 rounded-lg text-royal-blue hover:bg-white/60"
-                              title="Preview file"
-                            >
-                              <Eye className="w-4 h-4" />
-                            </button>
-                            <a
-                              href={file.fileUrl}
-                              download={file.fileName}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="p-2 rounded-lg text-royal-blue hover:bg-white/60"
-                              title="Download file"
-                            >
-                              <Download className="w-4 h-4" />
-                            </a>
-                          </>
-                        ) : (
-                          <span
-                            className="p-2 rounded-lg text-text-secondary/50 cursor-not-allowed"
-                            title="Still syncing to the server — try again once it finishes uploading"
-                          >
-                            <Clock className="w-4 h-4" />
-                          </span>
-                        )}
-                        <button
-                          onClick={() => openAccess(file)}
-                          className="p-2 rounded-lg text-royal-blue hover:bg-white/60"
-                          title="Manage which students can download this file"
-                        >
-                          <Users className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => openEdit(file)}
-                          className="p-2 rounded-lg text-royal-blue hover:bg-white/60"
-                          title="Edit title / description / publish state"
-                        >
-                          <Edit2 className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => {
-                            setReplaceTarget(file);
-                            setReplaceFile(null);
-                            if (replaceInputRef.current)
-                              replaceInputRef.current.value = "";
-                          }}
-                          className="p-2 rounded-lg text-amber-600 hover:bg-white/60"
-                          title="Replace the file contents"
-                        >
-                          <RefreshCcw className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => handleTogglePublish(file)}
-                          className="p-2 rounded-lg text-text-secondary hover:bg-white/60"
-                          title={
-                            file.isPublished
-                              ? "Unpublish (hide from students)"
-                              : "Publish (show to students)"
-                          }
-                        >
-                          {file.isPublished ? (
-                            <EyeOff className="w-4 h-4" />
+                    <td className="whitespace-nowrap text-muted">{formatDate(file.updatedAt)}</td>
+                    <td className="text-right">
+                      <Menu>
+                        <RowActionsTrigger label={`Actions for ${file.title}`} />
+                        <MenuContent>
+                          {file.fileUrl ? (
+                            <>
+                              <MenuItem onSelect={() => setPreviewFile(file)}>
+                                <Eye /> Preview
+                              </MenuItem>
+                              <MenuItem asChild>
+                                <a href={file.fileUrl} download={file.fileName} target="_blank" rel="noopener noreferrer">
+                                  <Download /> Download
+                                </a>
+                              </MenuItem>
+                            </>
                           ) : (
-                            <Eye className="w-4 h-4" />
+                            <MenuItem disabled>
+                              <Clock /> Still syncing…
+                            </MenuItem>
                           )}
-                        </button>
-                        <button
-                          onClick={() => setDeleteTarget(file)}
-                          className="p-2 rounded-lg text-red hover:bg-red/10"
-                          title="Delete file"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
+                          <MenuItem onSelect={() => openAccess(file)}>
+                            <Users /> Manage access
+                          </MenuItem>
+                          <MenuItem onSelect={() => openEditor(file)}>
+                            <Edit2 /> Edit or replace file
+                          </MenuItem>
+                          <MenuItem onSelect={() => togglePublish(file)}>
+                            {file.isPublished ? <EyeOff /> : <Eye />} {file.isPublished ? "Unpublish" : "Publish"}
+                          </MenuItem>
+                          <MenuSeparator />
+                          <MenuItem danger onSelect={() => setDeleteTarget(file)}>
+                            <Trash2 /> Delete
+                          </MenuItem>
+                        </MenuContent>
+                      </Menu>
                     </td>
                   </tr>
                 ))}
@@ -501,323 +309,114 @@ export default function RequirementFilesManagementSection({
         </div>
       )}
 
-      {/* Requirement File Preview Modal */}
-      <Dialog
-        open={!!previewFile}
-        onOpenChange={(open) => {
-          if (!open) setPreviewFile(null);
-        }}
+      <FilePreviewModal file={previewFile} onClose={() => setPreviewFile(null)} />
+
+      <Modal
+        open={editing !== null}
+        onClose={closeUnlessSaving(() => setEditing(null))}
+        title={isNew ? "Upload file" : "Edit file"}
+        description={isNew ? "Add a document for students." : "Update the details, or choose a new file to replace the current one."}
+        icon={<UploadCloud className="h-5 w-5 text-brand-500" />}
+        footer={
+          <>
+            <button className="btn btn-secondary" onClick={() => setEditing(null)} disabled={saving}>
+              Cancel
+            </button>
+            <button className="btn btn-primary" onClick={handleSubmit} disabled={saving}>
+              {saving ? (isNew || pickedFile ? "Uploading…" : "Saving…") : isNew ? "Upload" : "Save"}
+            </button>
+          </>
+        }
       >
-        <DialogContent className="glass-card-strong max-w-3xl">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              {previewFile?.title}
-            </DialogTitle>
-          </DialogHeader>
-
-          {previewFile && (
-            <div className="mt-4">
-              {previewFile.description && (
-                <p className="mb-4 text-sm text-text-secondary">
-                  {previewFile.description}
-                </p>
-              )}
-
-              <div className="max-h-[55vh] overflow-auto rounded-lg bg-white/30">
-                <FilePreview file={previewFile} />
-              </div>
-
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-                <span className="text-xs text-text-secondary">
-                  {previewFile.fileName} · {formatFileSize(previewFile.fileSize)}
-                </span>
-                <a
-                  href={previewFile.fileUrl}
-                  download={previewFile.fileName}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm glass-button"
-                >
-                  <Download className="w-4 h-4" />
-                  Download
-                </a>
-              </div>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
-
-      {/* Upload / Edit Modal */}
-      <Dialog
-        open={!!modal}
-        onOpenChange={(o) => !o && !saving && setModal(null)}
-      >
-        <DialogContent className="glass-card-strong max-w-md">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              {modal?.type === "create" ? "Upload File" : "Edit File"}
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1.5">
-                Title *
-              </label>
-              <input
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g. Enrollment Requirements Checklist"
-                className="w-full glass-input px-3 py-2.5 text-sm"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-dark mb-1.5">
-                Description
-              </label>
-              <textarea
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                rows={3}
-                placeholder="Optional short summary of this document"
-                className="w-full glass-input px-3 py-2.5 text-sm resize-none"
-              />
-            </div>
-
-            {modal?.type === "create" && (
-              <div>
-                <label className="block text-sm font-medium text-dark mb-1.5">
-                  File *
-                </label>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="application/pdf,image/*,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,audio/*,video/*"
-                  onChange={handleFilePick}
-                  className="block w-full text-sm text-text-secondary file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-royal-blue file:text-white file:text-sm file:cursor-pointer"
-                />
-                {selectedFile && (
-                  <p className="text-xs text-green-700 mt-1.5">
-                    Selected: {selectedFile.name} (
-                    {formatFileSize(selectedFile.size)})
-                  </p>
-                )}
-              </div>
-            )}
-
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={publish}
-                onChange={(e) => setPublish(e.target.checked)}
-                className="w-4 h-4 accent-royal-blue"
-              />
-              <span className="text-sm text-dark">
-                Publish immediately (visible to students in Records)
-              </span>
-            </label>
-
-            <div className="flex gap-3 pt-2">
-              <button
-                onClick={() => !saving && setModal(null)}
-                className="flex-1 glass-button px-4 py-2.5 text-sm"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSubmit}
-                disabled={saving}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2 text-sm disabled:opacity-70"
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                    {modal?.type === "create" ? "Uploading..." : "Saving..."}
-                  </>
-                ) : (
-                  <>
-                    <UploadCloud className="w-4 h-4" />
-                    {modal?.type === "create" ? "Upload" : "Save"}
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Replace File Modal */}
-      <Dialog
-        open={!!replaceTarget}
-        onOpenChange={(o) => !o && !saving && setReplaceTarget(null)}
-      >
-        <DialogContent className="glass-card-strong max-w-md">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              Replace File
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <p className="text-sm text-text-secondary">
-              Replace the file for{" "}
-              <span className="font-medium text-dark">
-                {replaceTarget?.title}
-              </span>
-              . The current file will be removed and the new one becomes active.
-            </p>
+        <div className="space-y-4">
+          <Field label="Title *">
+            <input className="input" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="e.g. Enrollment Requirements Checklist" />
+          </Field>
+          <Field label="Description">
+            <textarea
+              className="input resize-none"
+              rows={3}
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+              placeholder="Optional short summary of this document"
+            />
+          </Field>
+          <Field
+            label={isNew ? "File *" : "Replace file (optional)"}
+            hint={pickedFile ? <>Selected: {pickedFile.name} (<FileSize bytes={pickedFile.size} />)</> : !isNew && "The current file is removed and the new one becomes active."}
+          >
             <input
-              ref={replaceInputRef}
               type="file"
-              accept="application/pdf,image/*,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,audio/*,video/*"
-              onChange={handleReplacePick}
-              className="block w-full text-sm text-text-secondary file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-royal-blue file:text-white file:text-sm file:cursor-pointer"
+              accept={ACCEPT}
+              onChange={(e) => setPickedFile(e.target.files?.[0] ?? null)}
+              className="block w-full text-sm text-muted file:mr-3 file:cursor-pointer file:rounded-full file:border-0 file:bg-brand-500 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
             />
-            {replaceFile && (
-              <p className="text-xs text-green-700">
-                Selected: {replaceFile.name}
-              </p>
-            )}
-            <div className="flex gap-3 pt-2">
-              <button
-                onClick={() => !saving && setReplaceTarget(null)}
-                className="flex-1 glass-button px-4 py-2.5 text-sm"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleReplaceFile}
-                disabled={saving || !replaceFile}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2 text-sm disabled:opacity-70"
-              >
-                {saving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" /> Replacing...
-                  </>
-                ) : (
-                  <>
-                    <RefreshCcw className="w-4 h-4" /> Replace
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
+          </Field>
+          <label className="flex cursor-pointer items-center gap-3 text-sm text-ink">
+            <input type="checkbox" className="input" checked={form.publish} onChange={(e) => setForm({ ...form, publish: e.target.checked })} />
+            Publish (visible to students in Records)
+          </label>
+        </div>
+      </Modal>
 
-      {/* Manage Access (student-specific downloads) Modal */}
-      <Dialog
+      <Modal
         open={!!accessTarget}
-        onOpenChange={(o) => !o && !accessSaving && setAccessTarget(null)}
+        onClose={closeUnlessSaving(() => setAccessTarget(null))}
+        size="lg"
+        title="Manage access"
+        description={<>Choose who can download <b className="text-ink">{accessTarget?.title}</b>.</>}
+        icon={<Users className="h-5 w-5 text-brand-500" />}
+        footer={
+          <>
+            <span className="mr-auto self-center text-xs text-muted">
+              {selectedIds.size} student{selectedIds.size === 1 ? "" : "s"} selected
+            </span>
+            <button className="btn btn-secondary" onClick={() => setAccessTarget(null)} disabled={saving}>
+              Cancel
+            </button>
+            <button className="btn btn-primary" onClick={handleSaveAccess} disabled={saving || studentsLoading}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </>
+        }
       >
-        <DialogContent className="glass-card-strong max-w-lg">
-          <DialogHeader>
-            <DialogTitle className="font-display font-bold text-xl text-dark">
-              Manage Access
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <p className="text-sm text-text-secondary">
-              Choose who can download{" "}
-              <span className="font-medium text-dark">
-                {accessTarget?.title}
-              </span>
-              .
-            </p>
-
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={accessRestricted}
-                onChange={(e) => setAccessRestricted(e.target.checked)}
-                className="w-4 h-4 accent-royal-blue"
-              />
-              <span className="text-sm text-dark">
-                Restrict to selected students only (unchecked = everyone once
-                published)
-              </span>
-            </label>
-
-            <SearchFilterBar
-              value={studentSearch}
-              onChange={setStudentSearch}
-              placeholder="Search students by name or ID..."
-            />
-
+        <div className="space-y-4">
+          <label className="flex cursor-pointer items-start gap-3 text-sm text-ink">
+            <input type="checkbox" className="input mt-0.5" checked={restricted} onChange={(e) => setRestricted(e.target.checked)} />
+            Restrict to selected students only (unchecked = everyone once published)
+          </label>
+          <SearchInput value={studentSearch.query} onChange={studentSearch.setQuery} placeholder="Search students by name or ID…" />
+          <div className="max-h-64 divide-y divide-line overflow-y-auto rounded-2xl border border-line">
             {studentsLoading ? (
-              <SectionLoader />
-            ) : (
-              <div className="max-h-64 overflow-y-auto rounded-lg border border-white/50 divide-y divide-white/40">
-                {filteredStudents.length === 0 ? (
-                  <p className="p-4 text-sm text-text-secondary text-center">
-                    No students found.
-                  </p>
-                ) : (
-                  filteredStudents.map((student) => (
-                    <label
-                      key={student.id}
-                      className="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-white/40"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedStudentIds.has(student.id)}
-                        onChange={() => toggleStudent(student.id)}
-                        className="w-4 h-4 accent-royal-blue"
-                      />
-                      <span className="text-sm text-dark flex-1">
-                        {student.name}
-                      </span>
-                      <span className="text-xs text-text-secondary">
-                        {student.studentId}
-                      </span>
-                    </label>
-                  ))
-                )}
+              <div className="space-y-2 p-3">
+                {Array.from({ length: 4 }, (_, i) => (
+                  <Skeleton key={i} className="h-8 w-full" />
+                ))}
               </div>
+            ) : studentSearch.filtered.length === 0 ? (
+              <p className="p-4 text-center text-sm text-muted">No students found.</p>
+            ) : (
+              studentSearch.filtered.map((student) => (
+                <label key={student.id} className="flex cursor-pointer items-center gap-3 px-3 py-2.5 hover:bg-surface-2">
+                  <input type="checkbox" className="input" checked={selectedIds.has(student.id)} onChange={() => toggleStudent(student.id)} />
+                  <span className="flex-1 text-sm text-ink">{student.name}</span>
+                  <span className="text-xs text-muted">{student.studentId}</span>
+                </label>
+              ))
             )}
-
-            <p className="text-xs text-text-secondary">
-              {selectedStudentIds.size} student
-              {selectedStudentIds.size === 1 ? "" : "s"} selected
-            </p>
-
-            <div className="flex gap-3 pt-2">
-              <button
-                onClick={() => !accessSaving && setAccessTarget(null)}
-                className="flex-1 glass-button px-4 py-2.5 text-sm"
-                disabled={accessSaving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveAccess}
-                disabled={accessSaving || studentsLoading}
-                className="flex-1 btn-primary px-4 py-2.5 flex items-center justify-center gap-2 text-sm disabled:opacity-70"
-              >
-                {accessSaving ? (
-                  <>
-                    <Skeleton className="h-4 w-4 rounded-full" /> Saving...
-                  </>
-                ) : (
-                  "Save"
-                )}
-              </button>
-            </div>
           </div>
-        </DialogContent>
-      </Dialog>
+        </div>
+      </Modal>
 
-      {/* Delete Confirm */}
       <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
         onConfirm={handleDelete}
-        title="Delete File"
-        description={`Are you sure you want to delete "${deleteTarget?.title}"? The file will be permanently removed.`}
-        warningText="This action cannot be undone."
-        confirmLabel="Delete File"
+        title="Delete file"
+        description={`Delete "${deleteTarget?.title}"? The file will be permanently removed. This action cannot be undone.`}
+        confirmLabel="Delete file"
         loading={saving}
       />
-    </SectionLayout>
+    </Page>
   );
 }

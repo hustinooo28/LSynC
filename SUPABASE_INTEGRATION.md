@@ -69,7 +69,7 @@ VALUES ('<the auth user id>', 'admin', 'Display Name');
 ### Temporary officer identity display
 
 Officer profile images are not stored in Supabase. The dashboard always renders
-the local application asset `/DSSC_logo.png`, and displays the authenticated
+the local application asset `/DSSC-logo.png`, and displays the authenticated
 Supabase user's actual `auth.users.email` below it. `public.user_roles` stores
 only the account's role and display name used by application workflows.
 
@@ -79,7 +79,7 @@ remove the image field left by an earlier version. It does not modify
 image column, profile-picture record, upload flow, or Supabase Storage object
 for this temporary display.
 
-The repository includes the local asset at `public/DSSC_logo.png`. Keep that
+The repository includes the local asset at `public/DSSC-logo.png`. Keep that
 file available at the deployed application's site root. The older
 `DSSC-logo.png` filename remains only for receipt-generation compatibility.
 

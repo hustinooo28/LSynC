@@ -3,23 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#070b5c" />
     <link rel="icon" type="image/jpeg" href="/lsc-logo.jpg" />
-    <title>LSC Student Digital Board</title>
+    <title>LSynC — LSC Student Digital Board</title>
     <script>
-      (() => {
-        const key = "dssc-theme";
-        let saved = null;
-        try {
-          saved = window.localStorage.getItem(key);
-        } catch {
-          // Fall back to the browser preference when storage is unavailable.
-        }
-        const theme = saved === "light" || saved === "dark"
-          ? saved
-          : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-        document.documentElement.dataset.theme = theme;
-        document.documentElement.style.colorScheme = theme;
-      })();
+      try {
+        const saved = localStorage.getItem("dssc-theme");
+        document.documentElement.dataset.theme =
+          saved === "light" || saved === "dark" ? saved : matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
     </script>
   </head>
   <body>

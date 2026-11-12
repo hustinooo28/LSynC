@@ -1,115 +1,38 @@
-import { useMemo, useState, useCallback } from "react";
-import { matchesSearchWords } from "../lib/utils";
+import { useMemo, useState } from "react";
+import { matchesSearchWords } from "@/lib/utils";
+
+type Accessor<T> = (item: T) => string;
 
 /**
- * Generic search + multi-filter hook that replaces the duplicated
- * `searchTerm` / `filterX` / `filteredData` useMemo pattern found in every
- * management section.
- *
- * @example
- * ```ts
- * const { searchTerm, setSearchTerm, filters, setFilter, filtered } = useSearch({
- *   items: students,
- *   searchKeys: ["name", "studentId"],
- *   filters: {
- *     program: (s) => s.program,
- *     yearLevel: (s) => s.yearLevel.toString(),
- *   },
- * });
- * ```
+ * Search box + exact-match dropdown filters over an in-memory list.
+ * `text` builds the searchable string; each `filters` accessor is compared
+ * against the selected value ("" = any). Pass stable (module-level or
+ * memoized) accessors to avoid recomputing every render.
  */
-export interface UseSearchOptions<T> {
-  /** The full dataset to search/filter. */
-  items: T[];
-  /** Keys of `T` (or accessor results) to match against the search term. */
-  searchKeys: (keyof T | ((item: T) => string))[];
-  /** Named filters — each value is either a string key of T or an accessor. */
-  filters?: Record<string, (item: T) => string>;
-}
+export function useSearch<T>(items: T[], text: Accessor<T>, filters: Record<string, Accessor<T>> = {}) {
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Record<string, string>>({});
 
-export interface UseSearchReturn<T> {
-  searchTerm: string;
-  setSearchTerm: (v: string) => void;
-  filters: Record<string, string>;
-  setFilter: (key: string, value: string) => void;
-  /** Reset all filters and search to their defaults. */
-  resetFilters: () => void;
-  /** The derived filtered dataset. */
-  filtered: T[];
-  /** Number of active filter criteria (excluding search). */
-  activeFilterCount: number;
-}
-
-export function useSearch<T>({
-  items,
-  searchKeys,
-  filters: filterDefs = {},
-}: UseSearchOptions<T>): UseSearchReturn<T> {
-  const [searchTerm, setSearchTerm] = useState("");
-  const [filters, setFiltersState] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const key of Object.keys(filterDefs)) {
-      initial[key] = "";
-    }
-    return initial;
-  });
-
-  const setFilter = useCallback(
-    (key: string, value: string) =>
-      setFiltersState((prev) => ({ ...prev, [key]: value })),
-    [],
+  const filtered = useMemo(
+    () =>
+      items.filter(
+        (item) =>
+          matchesSearchWords(text(item), query) &&
+          Object.entries(filters).every(([key, get]) => !selected[key] || get(item) === selected[key]),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items, query, selected],
   );
-
-  const resetFilters = useCallback(() => {
-    const initial: Record<string, string> = {};
-    for (const key of Object.keys(filterDefs)) {
-      initial[key] = "";
-    }
-    setFiltersState(initial);
-    setSearchTerm("");
-  }, [filterDefs]);
-
-  const activeFilterCount = useMemo(
-    () => Object.values(filters).filter(Boolean).length,
-    [filters],
-  );
-
-  const filtered = useMemo(() => {
-    const query = searchTerm.trim();
-
-    return items.filter((item) => {
-      // Search match - every word in the query must appear somewhere
-      // across the search keys, in any order (see matchesSearchWords).
-      if (query) {
-        const haystack = searchKeys
-          .map((key) =>
-            typeof key === "function" ? key(item) : (item[key] as unknown),
-          )
-          .map((value) => String(value ?? ""))
-          .join(" ");
-
-        if (!matchesSearchWords(haystack, query)) return false;
-      }
-
-      // Filter matches
-      for (const [filterKey, accessor] of Object.entries(filterDefs)) {
-        const filterValue = filters[filterKey];
-        if (filterValue && accessor(item) !== filterValue) {
-          return false;
-        }
-      }
-
-      return true;
-    });
-  }, [items, searchKeys, filterDefs, searchTerm, filters]);
 
   return {
-    searchTerm,
-    setSearchTerm,
-    filters,
-    setFilter,
-    resetFilters,
+    query,
+    setQuery,
+    filters: selected,
+    setFilter: (key: string, value: string) => setSelected((prev) => ({ ...prev, [key]: value })),
+    reset: () => {
+      setQuery("");
+      setSelected({});
+    },
     filtered,
-    activeFilterCount,
   };
 }

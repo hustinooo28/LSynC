@@ -2,295 +2,170 @@ import type { User } from "@supabase/supabase-js";
 import { getSupabase } from "@/lib/supabase";
 import type { UserRole } from "@/types";
 
-// ------------------------------------------------------------------
-// Auth service — real Supabase Auth for officer accounts.
-//
-// Accounts are created in Supabase by supabase/security.sql:
-//   admin@studentboard.ph     (role: admin)
-//   secretary@studentboard.ph (role: secretary)
-//   treasurer@studentboard.ph (role: treasurer)
-//
-// The role lives in the public.user_roles table (one row per officer).
-// ------------------------------------------------------------------
+// Officer accounts live in Supabase Auth; each officer's role is a row in
+// public.user_roles (see supabase/security.sql).
 
 export interface AuthSession {
   user: User;
   role: UserRole;
-  // Human-readable name used for the "recorded by" fields.
+  /** Used for the "recorded by" fields. */
   displayName: string;
 }
 
-const ROLE_LABELS: Record<UserRole, string> = {
+// Fallback "recorded by" names (persisted on records, so keep them stable).
+const DEFAULT_NAMES: Record<UserRole, string> = {
   admin: "Student Council Admin",
   secretary: "Council Secretary",
   treasurer: "Council Treasurer",
   auditor: "Council Auditor",
   "board-member": "Board Member",
 };
+
+// Last verified role, so a signed-in officer can still open the app offline.
 const AUTH_CACHE_KEY = "dtb-offline-auth-session";
+type CachedAuthSession = { userId: string; role: UserRole; displayName: string };
 
-interface CachedAuthSession {
-  userId: string;
-  role: UserRole;
-  displayName: string;
-}
-function saveCachedAuthSession(session: AuthSession): void {
+function storage<T>(action: () => T, label: string): T | null {
   try {
-    localStorage.setItem(
-      AUTH_CACHE_KEY,
-      JSON.stringify({
-        userId: session.user.id,
-        role: session.role,
-        displayName: session.displayName,
-      } satisfies CachedAuthSession),
-    );
+    return action();
   } catch (error) {
-    console.warn("Failed to cache auth session:", error);
-  }
-}
-
-function getCachedAuthSession(user: User): CachedAuthSession | null {
-  try {
-    const raw = localStorage.getItem(AUTH_CACHE_KEY);
-
-    if (!raw) return null;
-
-    const cached = JSON.parse(raw) as CachedAuthSession;
-
-    // Never use another user's cached role.
-    if (cached.userId !== user.id) return null;
-
-    return cached;
-  } catch (error) {
-    console.warn("Failed to read cached auth session:", error);
+    console.warn(`Failed to ${label} cached auth session:`, error);
     return null;
   }
 }
 
-function clearCachedAuthSession(): void {
-  try {
-    localStorage.removeItem(AUTH_CACHE_KEY);
-  } catch (error) {
-    console.warn("Failed to clear cached auth session:", error);
-  }
+const saveCachedSession = ({ user, role, displayName }: AuthSession) =>
+  storage(
+    () =>
+      localStorage.setItem(
+        AUTH_CACHE_KEY,
+        JSON.stringify({ userId: user.id, role, displayName } satisfies CachedAuthSession),
+      ),
+    "save",
+  );
+
+const clearCachedSession = () => storage(() => localStorage.removeItem(AUTH_CACHE_KEY), "clear");
+
+function readCachedSession(user: User): CachedAuthSession | null {
+  const cached = storage(() => {
+    const raw = localStorage.getItem(AUTH_CACHE_KEY);
+    return raw ? (JSON.parse(raw) as CachedAuthSession) : null;
+  }, "read");
+  // Never reuse another user's cached role.
+  return cached?.userId === user.id ? cached : null;
 }
 
-/** Reads the officer's role from public.user_roles. */
-interface RoleRecord {
-  role: UserRole;
-  name: string | null;
-}
-
-async function fetchRole(userId: string): Promise<RoleRecord | null> {
+/** The officer's role row, or null when there is none. Throws when the lookup itself fails. */
+async function fetchRole(userId: string): Promise<{ role: UserRole; name: string | null } | null> {
   const { data, error } = await getSupabase()
     .from("user_roles")
     .select("role, name")
     .eq("user_id", userId)
     .maybeSingle();
-
-  if (error) {
-    console.error("auth: could not read role:", error.message);
-    return null;
-  }
-  if (!data || !data.role) return null;
-  return data as RoleRecord;
+  if (error) throw error;
+  return data?.role ? data : null;
 }
 
-function toDisplayName(user: User, role: UserRole): string {
-  const metaName =
-    user.user_metadata?.name ||
-    user.user_metadata?.full_name ||
-    user.user_metadata?.display_name;
-  if (metaName) return String(metaName);
-  return ROLE_LABELS[role];
+function buildSession(user: User, role: UserRole, name: string | null): AuthSession {
+  const meta = user.user_metadata ?? {};
+  const displayName = name || meta.name || meta.full_name || meta.display_name || DEFAULT_NAMES[role];
+  const session = { user, role, displayName: String(displayName) };
+  saveCachedSession(session);
+  return session;
 }
 
-function friendlyAuthMessage(message: string): string {
-  const m = message.toLowerCase();
-  if (
-    m.includes("invalid login credentials") ||
-    m.includes("invalid credentials")
-  ) {
-    return "Invalid email or password. Please try again.";
-  }
-  if (m.includes("email not confirmed")) {
-    return "Please confirm your email address before signing in.";
-  }
-  if (m.includes("rate limit")) {
-    return "Too many attempts. Please wait a moment and try again.";
-  }
-  if (m.includes("email address")) {
-    return "No account found with that email address.";
-  }
-  if (m.includes("password should be at least")) {
-    return "Password should be at least 6 characters.";
-  }
-  if (m.includes("same password") || m.includes("different from the old")) {
-    return "New password must be different from your current password.";
-  }
-  if (m.includes("auth session missing") || m.includes("session_not_found")) {
-    return "This reset link has expired or was already used. Request a new one.";
-  }
-  return message;
-}
+const FRIENDLY_MESSAGES: [RegExp, string][] = [
+  [/invalid (login )?credentials/, "Invalid email or password. Please try again."],
+  [/email not confirmed/, "Please confirm your email address before signing in."],
+  [/rate limit/, "Too many attempts. Please wait a moment and try again."],
+  [/email address/, "No account found with that email address."],
+  [/password should be at least/, "Password should be at least 6 characters."],
+  [/same password|different from the old/, "New password must be different from your current password."],
+  [/auth session missing|session_not_found/, "This reset link has expired or was already used. Request a new one."],
+];
+
+const friendlyError = (message: string): Error =>
+  new Error(FRIENDLY_MESSAGES.find(([pattern]) => pattern.test(message.toLowerCase()))?.[1] ?? message);
 
 export const authService = {
-  /** Signs an officer in with email + password and resolves their role. */
   async signIn(email: string, password: string): Promise<AuthSession> {
     const { data, error } = await getSupabase().auth.signInWithPassword({
       email: email.trim().toLowerCase(),
       password,
     });
+    if (error) throw friendlyError(error.message);
+    if (!data.user) throw new Error("Sign in succeeded but no user was returned.");
 
-    if (error) throw new Error(friendlyAuthMessage(error.message));
-    if (!data.user)
-      throw new Error("Sign in succeeded but no user was returned.");
-
-    const roleRecord = await fetchRole(data.user.id);
+    const roleRecord = await fetchRole(data.user.id).catch((roleError) => {
+      console.error("auth: could not read role:", roleError);
+      return null;
+    });
     if (!roleRecord) {
-      // No role row → this Supabase user is not an officer. Sign back out
-      // immediately so the app is never left in a half-authed state.
+      // Not an officer: never leave the app half-authenticated.
       await getSupabase().auth.signOut();
       throw new Error(
-        "This account is not assigned an officer role. " +
-          "Ask the administrator to add it to user_roles.",
+        "This account is not assigned an officer role. Ask the administrator to add it to user_roles.",
       );
     }
-
-    const authSession: AuthSession = {
-      user: data.user,
-      role: roleRecord.role,
-      displayName: roleRecord.name || toDisplayName(data.user, roleRecord.role),
-    };
-
-    saveCachedAuthSession(authSession);
-
-    return authSession;
+    return buildSession(data.user, roleRecord.role, roleRecord.name);
   },
 
-  /** Restores a persisted session after a page reload (null when signed out). */
+  /** Restores a persisted session after reload (null when signed out). */
   async restoreSession(): Promise<AuthSession | null> {
     const {
       data: { session },
       error,
     } = await getSupabase().auth.getSession();
-
-    if (error || !session?.user) {
-      return null;
-    }
-
-    const cached = getCachedAuthSession(session.user);
+    if (error || !session?.user) return null;
+    const { user } = session;
 
     try {
-      const roleRecord = await fetchRole(session.user.id);
-
-      if (roleRecord) {
-        const authSession: AuthSession = {
-          user: session.user,
-          role: roleRecord.role,
-          displayName:
-            roleRecord.name || toDisplayName(session.user, roleRecord.role),
-        };
-
-        saveCachedAuthSession(authSession);
-
-        return authSession;
-      }
-
-      /*
-       * If Supabase is reachable but the user genuinely has no role,
-       * this account should not remain authenticated as an officer.
-       */
-      if (navigator.onLine) {
-        clearCachedAuthSession();
-        await getSupabase().auth.signOut();
-        return null;
-      }
-    } catch (error) {
-      console.warn(
-        "Could not verify role online. Attempting offline auth recovery:",
-        error,
-      );
+      const roleRecord = await fetchRole(user.id);
+      if (roleRecord) return buildSession(user, roleRecord.role, roleRecord.name);
+      // Reachable server says this user has no role: sign them out.
+      clearCachedSession();
+      await getSupabase().auth.signOut();
+      return null;
+    } catch (roleError) {
+      console.warn("Could not verify role online; using the offline cache:", roleError);
     }
 
-    /*
-     * Offline fallback:
-     * Supabase still has a valid persisted session, but we cannot
-     * query user_roles. Restore the previously verified local role.
-     */
-    if (cached) {
-      return {
-        user: session.user,
-        role: cached.role,
-        displayName: cached.displayName,
-      };
-    }
-
-    return null;
+    const cached = readCachedSession(user);
+    return cached ? { user, role: cached.role, displayName: cached.displayName } : null;
   },
 
   async signOut(): Promise<void> {
-    clearCachedAuthSession();
+    clearCachedSession();
     await getSupabase().auth.signOut();
   },
 
-  /**
-   * Sends a password-reset email to an officer account. The link in that
-   * email brings them back to this app (redirectTo below), at which point
-   * Supabase fires a PASSWORD_RECOVERY auth event — see onPasswordRecovery.
-   * Uses the anon key only; safe to call from the browser.
-   */
+  /** Emails a reset link that returns to this page and fires PASSWORD_RECOVERY. */
   async requestPasswordReset(email: string): Promise<void> {
-    const { error } = await getSupabase().auth.resetPasswordForEmail(
-      email.trim().toLowerCase(),
-      { redirectTo: window.location.origin + window.location.pathname },
-    );
-    if (error) throw new Error(friendlyAuthMessage(error.message));
+    const { error } = await getSupabase().auth.resetPasswordForEmail(email.trim().toLowerCase(), {
+      redirectTo: window.location.origin + window.location.pathname,
+    });
+    if (error) throw friendlyError(error.message);
   },
 
-  /**
-   * Sets a new password. Must be called while a recovery session is active
-   * (i.e. after the PASSWORD_RECOVERY event has fired), or while an officer
-   * is normally signed in.
-   */
   async hasRecoverySession(): Promise<boolean> {
-    const {
-      data: { session },
-      error,
-    } = await getSupabase().auth.getSession();
-
+    const { data, error } = await getSupabase().auth.getSession();
     if (error) {
       console.error("Could not check recovery session:", error);
       return false;
     }
-
-    return Boolean(session);
+    return Boolean(data.session);
   },
+
   async updatePassword(newPassword: string): Promise<void> {
-    const { error } = await getSupabase().auth.updateUser({
-      password: newPassword,
-    });
-    if (error) throw new Error(friendlyAuthMessage(error.message));
+    const { error } = await getSupabase().auth.updateUser({ password: newPassword });
+    if (error) throw friendlyError(error.message);
   },
 
-  /**
-   * Subscribes to the PASSWORD_RECOVERY auth event, which Supabase fires
-   * once when the user lands on this page via a password-reset link.
-   * Returns an unsubscribe function.
-   */
+  /** Calls back when the user lands here from a password-reset link. Returns an unsubscribe. */
   onPasswordRecovery(callback: () => void): () => void {
-    const supabase = getSupabase();
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === "PASSWORD_RECOVERY" && session) {
-        callback();
-      }
+    const { data } = getSupabase().auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY" && session) callback();
     });
-
-    return () => subscription.unsubscribe();
+    return () => data.subscription.unsubscribe();
   },
 };
-
-export type { UserRole };

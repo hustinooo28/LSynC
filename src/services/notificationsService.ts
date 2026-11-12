@@ -1,13 +1,7 @@
 import { getSupabase } from "../lib/supabase";
 
-const createRecordId = (): string => crypto.randomUUID();
-
-export type NotificationType = "payment" | "file" | "deadline" | "announcement";
-export type RecipientKind =
-  | "officer"
-  | "all_officers"
-  | "student"
-  | "all_students";
+type NotificationType = "payment" | "file" | "deadline" | "announcement";
+type RecipientKind = "officer" | "all_officers" | "student" | "all_students";
 
 export interface AppNotification {
   id: string;
@@ -35,174 +29,59 @@ interface NotificationRow {
   created_at: string;
 }
 
-function fromRow(row: NotificationRow): AppNotification {
-  return {
-    id: row.id,
-    recipientKind: row.recipient_kind,
-    recipientUserId: row.recipient_user_id,
-    recipientStudentId: row.recipient_student_id,
-    type: row.type,
-    title: row.title,
-    body: row.body,
-    link: row.link,
-    readAt: row.read_at,
-    createdAt: row.created_at,
-  };
-}
+const sb = () => getSupabase();
+const now = () => new Date().toISOString();
 
-// ============================================
-// OFFICER SIDE — real auth.uid(), RLS-gated
-// ============================================
+const fromRow = (row: NotificationRow): AppNotification => ({
+  id: row.id,
+  recipientKind: row.recipient_kind,
+  recipientUserId: row.recipient_user_id,
+  recipientStudentId: row.recipient_student_id,
+  type: row.type,
+  title: row.title,
+  body: row.body,
+  link: row.link,
+  readAt: row.read_at,
+  createdAt: row.created_at,
+});
 
-/** RLS already limits this to the signed-in officer's own rows + all_officers broadcasts. */
-async function getForOfficer(limit = 50): Promise<AppNotification[]> {
-  const { data, error } = await getSupabase()
-    .from("notifications")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw error;
-  return (data as NotificationRow[]).map(fromRow);
-}
-
-async function getUnreadCountForOfficer(): Promise<number> {
-  const { count, error } = await getSupabase()
-    .from("notifications")
-    .select("id", { count: "exact", head: true })
-    .is("read_at", null);
-
-  if (error) throw error;
-  return count ?? 0;
-}
-
-async function markAsRead(id: string): Promise<void> {
-  const { error } = await getSupabase()
-    .from("notifications")
-    .update({ read_at: new Date().toISOString() })
-    .eq("id", id);
-
+async function run(query: PromiseLike<{ error: unknown }>): Promise<void> {
+  const { error } = await query;
   if (error) throw error;
 }
 
-async function markAllReadForOfficer(): Promise<void> {
-  const { error } = await getSupabase()
-    .from("notifications")
-    .update({ read_at: new Date().toISOString() })
-    .is("read_at", null);
-
-  if (error) throw error;
-}
-
-/** Realtime for the officer bell — mirrors subscribeToTables in db.ts. */
-function subscribeOfficer(onInsert: (n: AppNotification) => void): () => void {
-  const sb = getSupabase();
-  const channel = sb.channel(`notifications-officer-${createRecordId()}`);
-
-  channel.on(
-    "postgres_changes",
-    { event: "INSERT", schema: "public", table: "notifications" },
-    (payload) => onInsert(fromRow(payload.new as NotificationRow)),
-  );
-
-  channel.subscribe();
-  return () => {
-    void sb.removeChannel(channel);
-  };
-}
-
-// ============================================
-// STUDENT SIDE — no login; public rows filtered
-// client-side by whichever student record is open.
-// No persisted read state (no identity to attach it to).
-// ============================================
-
-async function getForStudent(
-  studentId: string,
-  limit = 20,
+async function list(
+  query: PromiseLike<{ data: NotificationRow[] | null; error: unknown }>,
 ): Promise<AppNotification[]> {
-  const { data, error } = await getSupabase()
-    .from("notifications")
-    .select("*")
-    .or(
-      `recipient_kind.eq.all_students,and(recipient_kind.eq.student,recipient_student_id.eq.${studentId})`,
-    )
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
+  const { data, error } = await query;
   if (error) throw error;
-  return (data as NotificationRow[]).map(fromRow);
+  return (data ?? []).map(fromRow);
 }
 
-function subscribeStudent(
-  studentId: string,
+const notifications = (limit: number) =>
+  sb().from("notifications").select("*").order("created_at", { ascending: false }).limit(limit);
+
+/** Realtime INSERTs on notifications, optionally filtered client-side. Returns an unsubscribe. */
+function subscribeInserts(
+  scope: string,
   onInsert: (n: AppNotification) => void,
+  relevant: (row: NotificationRow) => boolean = () => true,
 ): () => void {
-  const sb = getSupabase();
-  const channel = sb.channel(`notifications-student-${createRecordId()}`);
-
-  channel.on(
-    "postgres_changes",
-    { event: "INSERT", schema: "public", table: "notifications" },
-    (payload) => {
-      const row = payload.new as NotificationRow;
-      const relevant =
-        row.recipient_kind === "all_students" ||
-        (row.recipient_kind === "student" &&
-          row.recipient_student_id === studentId);
-      if (relevant) onInsert(fromRow(row));
-    },
-  );
-
+  const client = sb();
+  const channel = client.channel(`notifications-${scope}-${crypto.randomUUID()}`);
+  channel.on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications" }, (payload) => {
+    const row = payload.new as NotificationRow;
+    if (relevant(row)) onInsert(fromRow(row));
+  });
   channel.subscribe();
   return () => {
-    void sb.removeChannel(channel);
+    void client.removeChannel(channel);
   };
 }
 
-// ============================================
-// PUBLIC SIDE — no login at all, any visitor.
-// Broadcasts only (never a specific student's own
-// payment/deadline rows) — those still need the
-// per-student query above, scoped to one record.
-// ============================================
-
-async function getPublicBroadcasts(limit = 20): Promise<AppNotification[]> {
-  const { data, error } = await getSupabase()
-    .from("notifications")
-    .select("*")
-    .eq("recipient_kind", "all_students")
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw error;
-  return (data as NotificationRow[]).map(fromRow);
-}
-
-function subscribePublicBroadcasts(
-  onInsert: (n: AppNotification) => void,
-): () => void {
-  const sb = getSupabase();
-  const channel = sb.channel(`notifications-public-${createRecordId()}`);
-
-  channel.on(
-    "postgres_changes",
-    { event: "INSERT", schema: "public", table: "notifications" },
-    (payload) => {
-      const row = payload.new as NotificationRow;
-      if (row.recipient_kind === "all_students") onInsert(fromRow(row));
-    },
-  );
-
-  channel.subscribe();
-  return () => {
-    void sb.removeChannel(channel);
-  };
-}
-
-// ============================================
-// PUSH SUBSCRIPTIONS
-// ============================================
+const isForStudent = (row: NotificationRow, studentId: string) =>
+  row.recipient_kind === "all_students" ||
+  (row.recipient_kind === "student" && row.recipient_student_id === studentId);
 
 interface PushKeys {
   endpoint: string;
@@ -210,142 +89,84 @@ interface PushKeys {
   authKey: string;
 }
 
-async function subscribeOfficerPush(keys: PushKeys): Promise<void> {
-  const { data: userData, error: userError } =
-    await getSupabase().auth.getUser();
-  if (userError) throw userError;
-  if (!userData.user)
-    throw new Error("Must be signed in to subscribe to push notifications.");
-
-  // Delete-then-insert rather than upsert: this endpoint may currently
-  // belong to a different subscriber_kind row (same browser, different
-  // identity earlier), and there's no UPDATE policy to transfer it —
-  // deleting by endpoint is allowed for anyone who has that endpoint,
-  // which only the owning browser ever does.
-  await getSupabase()
-    .from("push_subscriptions")
-    .delete()
-    .eq("endpoint", keys.endpoint);
-
-  const { error } = await getSupabase().from("push_subscriptions").insert({
-    id: createRecordId(),
-    subscriber_kind: "officer",
-    officer_user_id: userData.user.id,
-    endpoint: keys.endpoint,
-    p256dh: keys.p256dh,
-    auth_key: keys.authKey,
-    created_at: new Date().toISOString(),
-  });
-
-  if (error) throw error;
-}
-
-async function subscribeStudentPush(
-  studentId: string,
+// Delete-then-insert rather than upsert: the endpoint may belong to a row of
+// another subscriber kind (same browser, earlier identity) and there is no
+// UPDATE policy; deleting by endpoint is only possible for its owning browser.
+async function savePushSubscription(
   keys: PushKeys,
+  subscriber: { subscriber_kind: "officer" | "student" | "anonymous"; officer_user_id?: string; student_id?: string },
 ): Promise<void> {
-  await getSupabase()
-    .from("push_subscriptions")
-    .delete()
-    .eq("endpoint", keys.endpoint);
-
-  const { error } = await getSupabase().from("push_subscriptions").insert({
-    id: createRecordId(),
-    subscriber_kind: "student",
-    student_id: studentId,
-    endpoint: keys.endpoint,
-    p256dh: keys.p256dh,
-    auth_key: keys.authKey,
-    created_at: new Date().toISOString(),
-  });
-
-  if (error) throw error;
-}
-
-async function unsubscribePush(endpoint: string): Promise<void> {
-  const { error } = await getSupabase()
-    .from("push_subscriptions")
-    .delete()
-    .eq("endpoint", endpoint);
-  if (error) throw error;
-}
-
-// ============================================
-// MANUAL SEND — staff only (public.is_staff()),
-// enforced by the INSERT policy, not just this function.
-// ============================================
-
-interface SendAnnouncementInput {
-  recipientKind: Extract<
-    RecipientKind,
-    "all_students" | "all_officers" | "student"
-  >;
-  /** Required when recipientKind === "student" — the internal students.id. */
-  recipientStudentId?: string;
-  title: string;
-  body: string;
-}
-
-async function sendAnnouncement(input: SendAnnouncementInput): Promise<void> {
-  const { error } = await getSupabase()
-    .from("notifications")
-    .insert({
-      id: createRecordId(),
-      recipient_kind: input.recipientKind,
-      recipient_student_id:
-        input.recipientKind === "student"
-          ? (input.recipientStudentId ?? null)
-          : null,
-      type: "announcement",
-      title: input.title,
-      body: input.body,
-      link: null,
-      created_at: new Date().toISOString(),
-    });
-
-  if (error) throw error;
-}
-
-async function deleteNotification(id: string): Promise<void> {
-  const { error } = await getSupabase()
-    .from("notifications")
-    .delete()
-    .eq("id", id);
-  if (error) throw error;
-}
-
-async function subscribeAnonymousPush(keys: PushKeys): Promise<void> {
-  await getSupabase()
-    .from("push_subscriptions")
-    .delete()
-    .eq("endpoint", keys.endpoint);
-
-  const { error } = await getSupabase().from("push_subscriptions").insert({
-    id: createRecordId(),
-    subscriber_kind: "anonymous",
-    endpoint: keys.endpoint,
-    p256dh: keys.p256dh,
-    auth_key: keys.authKey,
-    created_at: new Date().toISOString(),
-  });
-
-  if (error) throw error;
+  await sb().from("push_subscriptions").delete().eq("endpoint", keys.endpoint);
+  await run(
+    sb()
+      .from("push_subscriptions")
+      .insert({
+        id: crypto.randomUUID(),
+        ...subscriber,
+        endpoint: keys.endpoint,
+        p256dh: keys.p256dh,
+        auth_key: keys.authKey,
+        created_at: now(),
+      }),
+  );
 }
 
 export const notificationsService = {
-  getForOfficer,
-  getUnreadCountForOfficer,
-  markAsRead,
-  markAllReadForOfficer,
-  subscribeOfficer,
-  getForStudent,
-  subscribeStudent,
-  getPublicBroadcasts,
-  subscribePublicBroadcasts,
-  sendAnnouncement,
-  deleteNotification,
-  subscribeOfficerPush,
-  subscribeStudentPush,
-  subscribeAnonymousPush,
-  unsubscribePush,
+  // Officer side: RLS limits rows to the officer's own + all_officers broadcasts.
+  getForOfficer: (limit = 50) => list(notifications(limit)),
+  subscribeOfficer: (onInsert: (n: AppNotification) => void) => subscribeInserts("officer", onInsert),
+  markAsRead: (id: string) => run(sb().from("notifications").update({ read_at: now() }).eq("id", id)),
+  markAllReadForOfficer: () => run(sb().from("notifications").update({ read_at: now() }).is("read_at", null)),
+
+  // Student side: no login, so rows are filtered by the open student record
+  // and read state is not persisted.
+  getForStudent: (studentId: string, limit = 20) =>
+    list(
+      notifications(limit).or(
+        `recipient_kind.eq.all_students,and(recipient_kind.eq.student,recipient_student_id.eq.${studentId})`,
+      ),
+    ),
+  subscribeStudent: (studentId: string, onInsert: (n: AppNotification) => void) =>
+    subscribeInserts("student", onInsert, (row) => isForStudent(row, studentId)),
+
+  // Any visitor: broadcasts only, never a specific student's rows.
+  getPublicBroadcasts: (limit = 20) => list(notifications(limit).eq("recipient_kind", "all_students")),
+  subscribePublicBroadcasts: (onInsert: (n: AppNotification) => void) =>
+    subscribeInserts("public", onInsert, (row) => row.recipient_kind === "all_students"),
+
+  /** Staff only — enforced by the INSERT policy (public.is_staff()). */
+  sendAnnouncement: (input: {
+    recipientKind: Extract<RecipientKind, "all_students" | "all_officers" | "student">;
+    /** Required when recipientKind === "student" (the internal students.id). */
+    recipientStudentId?: string;
+    title: string;
+    body: string;
+  }) =>
+    run(
+      sb()
+        .from("notifications")
+        .insert({
+          id: crypto.randomUUID(),
+          recipient_kind: input.recipientKind,
+          recipient_student_id: input.recipientKind === "student" ? (input.recipientStudentId ?? null) : null,
+          type: "announcement",
+          title: input.title,
+          body: input.body,
+          link: null,
+          created_at: now(),
+        }),
+    ),
+
+  deleteNotification: (id: string) => run(sb().from("notifications").delete().eq("id", id)),
+
+  async subscribeOfficerPush(keys: PushKeys): Promise<void> {
+    const { data, error } = await sb().auth.getUser();
+    if (error) throw error;
+    if (!data.user) throw new Error("Must be signed in to subscribe to push notifications.");
+    await savePushSubscription(keys, { subscriber_kind: "officer", officer_user_id: data.user.id });
+  },
+  subscribeStudentPush: (studentId: string, keys: PushKeys) =>
+    savePushSubscription(keys, { subscriber_kind: "student", student_id: studentId }),
+  subscribeAnonymousPush: (keys: PushKeys) => savePushSubscription(keys, { subscriber_kind: "anonymous" }),
+  unsubscribePush: (endpoint: string) => run(sb().from("push_subscriptions").delete().eq("endpoint", endpoint)),
 };

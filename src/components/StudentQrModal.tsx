@@ -1,22 +1,17 @@
-import { useEffect, useState } from 'react';
-import { Download, QrCode } from 'lucide-react';
-import type { Student } from '@/types';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { toast } from 'sonner';
-import { downloadStudentAttendancePass, studentAttendancePassSvg } from '@/lib/qr';
-import Skeleton from '@/components/Skeleton';
+import { useEffect, useState } from "react";
+import { Download, QrCode } from "lucide-react";
+import { toast } from "sonner";
+import type { Student } from "@/types";
+import { downloadStudentAttendancePass, studentAttendancePassSvg } from "@/lib/qr";
+import Modal from "@/components/ui/Modal";
+import Skeleton from "@/components/ui/Skeleton";
 
 interface StudentQrModalProps {
   student: Student | null;
   onClose: () => void;
 }
 
-/**
- * Preview + download dialog for a student's official attendance pass. The QR
- * encodes Student ID, Name, Program, Year, and Section; the preview renders the
- * exact generated pass SVG (including the separate privacy notice at the
- * bottom) so the on-screen viewing always matches the downloaded PNG/SVG.
- */
+/** Preview + download of a student's attendance pass; the preview is the exact exported SVG. */
 export default function StudentQrModal({ student, onClose }: StudentQrModalProps) {
   const [passSrc, setPassSrc] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -26,109 +21,59 @@ export default function StudentQrModal({ student, onClose }: StudentQrModalProps
     let alive = true;
     setPassSrc(null);
     studentAttendancePassSvg(student)
-      .then((svg) => {
-        if (alive) setPassSrc(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
-      })
+      .then((svg) => alive && setPassSrc(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`))
       .catch((error) => {
-        console.error('Error generating attendance pass:', error);
-        if (alive) toast.error('Failed to generate the Attendance Pass');
+        console.error("Error generating attendance pass:", error);
+        if (alive) toast.error("Failed to generate the Attendance Pass");
       });
     return () => {
       alive = false;
     };
   }, [student]);
 
-  const handleDownloadPng = async () => {
-    if (!student || !passSrc) return;
-    try {
-      setDownloading(true);
-      toast.success(await downloadStudentAttendancePass(student, 'png'));
-    } catch (error) {
-      console.error('Error downloading attendance pass:', error);
-      toast.error('Failed to download the Attendance Pass');
-    } finally {
-      setDownloading(false);
-    }
-  };
-
-  const handleDownloadSvg = async () => {
+  const download = async (format: "png" | "svg") => {
     if (!student) return;
+    setDownloading(true);
     try {
-      setDownloading(true);
-      toast.success(await downloadStudentAttendancePass(student, 'svg'));
+      toast.success(await downloadStudentAttendancePass(student, format));
     } catch (error) {
-      console.error('Error downloading attendance pass:', error);
-      toast.error('Failed to download the Attendance Pass');
+      console.error("Error downloading attendance pass:", error);
+      toast.error("Failed to download the Attendance Pass");
     } finally {
       setDownloading(false);
     }
   };
 
   return (
-    <Dialog open={!!student} onOpenChange={onClose}>
-      <DialogContent className="glass-card-strong max-h-[calc(100dvh-1rem)] w-[calc(100%-1rem)] max-w-2xl p-4 sm:max-h-[calc(100dvh-2rem)] sm:w-[calc(100%-2rem)] sm:p-6 [&>[data-slot=scroll-area]]:min-h-0">
-        <DialogHeader className="pr-8">
-          <DialogTitle className="flex items-center gap-2 font-display text-xl font-bold text-dark">
-            <QrCode className="h-5 w-5 shrink-0 text-[var(--dssc-royal-blue)]" />
-            Student QR Attendance Pass
-          </DialogTitle>
-        </DialogHeader>
-
-        {student && (
-          <div className="mt-3 space-y-4 pb-4 sm:mt-4 sm:space-y-5">
-            {/* Exact generated pass preview — 12 cm × 6.5 cm aspect ratio */}
-            <article className="relative w-full overflow-hidden rounded-xl border border-[var(--dssc-border)] bg-white shadow-card" style={{ aspectRatio: '12 / 6.5' }}>
-              {passSrc ? (
-                <img
-                  src={passSrc}
-                  alt={`Student QR Attendance Pass for ${student.name}`}
-                  className="h-full w-full object-contain"
-                />
-              ) : (
-                <div className="flex h-full w-full items-center justify-center" role="status" aria-label="Generating attendance pass">
-                  <Skeleton className="h-3/5 w-3/5 rounded-lg" />
-                </div>
-              )}
-            </article>
-
-            <p className="px-1 text-center text-xs leading-5 text-text-secondary">
-              Scan this QR code at LSC events to record attendance. The pass carries the
-              required data privacy notice at the bottom. Download the complete pass as PNG or SVG.
-            </p>
-
-            <div className="sticky bottom-0 z-10 -mx-1 border-t border-[var(--dssc-border)] bg-[var(--dssc-off-white)] px-1 pb-1 pt-3 shadow-[0_-8px_16px_rgba(244,246,252,0.95)]">
-              <div className="flex flex-col gap-3 sm:flex-row">
-                <button
-                  type="button"
-                  onClick={handleDownloadPng}
-                  disabled={downloading || !passSrc}
-                  className="min-h-11 flex-1 px-4 py-2.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {downloading ? (
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                  ) : (
-                    <Download className="h-4 w-4" />
-                  )}
-                  Download Pass PNG
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDownloadSvg}
-                  disabled={downloading}
-                  className="min-h-11 flex-1 px-4 py-2.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {downloading ? (
-                    <Skeleton className="h-4 w-4 rounded-full" />
-                  ) : (
-                    <Download className="h-4 w-4" />
-                  )}
-                  Download Pass SVG
-                </button>
-              </div>
-            </div>
+    <Modal
+      open={!!student}
+      onClose={onClose}
+      size="2xl"
+      icon={<QrCode className="h-5 w-5 text-brand-500" />}
+      title="Student QR Attendance Pass"
+      description="Scan this QR code at LSC events to record attendance. The pass includes the required data privacy notice."
+      footer={(["png", "svg"] as const).map((format) => (
+        <button
+          key={format}
+          className={`btn ${format === "png" ? "btn-primary" : "btn-secondary"} flex-1 sm:flex-none`}
+          onClick={() => download(format)}
+          disabled={downloading || !passSrc}
+        >
+          <Download className="h-4 w-4" />
+          Download {format.toUpperCase()}
+        </button>
+      ))}
+    >
+      {/* 12 cm × 6.5 cm pass ratio */}
+      <div className="aspect-[12/6.5] w-full overflow-hidden rounded-2xl border border-line bg-white">
+        {passSrc ? (
+          <img src={passSrc} alt={student ? `Student QR Attendance Pass for ${student.name}` : ""} className="h-full w-full object-contain" />
+        ) : (
+          <div className="grid h-full place-items-center" role="status" aria-label="Generating attendance pass">
+            <Skeleton className="h-3/5 w-3/5" />
           </div>
         )}
-      </DialogContent>
-    </Dialog>
+      </div>
+    </Modal>
   );
 }

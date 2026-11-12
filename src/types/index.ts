@@ -49,29 +49,7 @@ export interface Event {
   evaluationActive?: boolean;
   /** Google Form URL for this event's evaluation (ideally prefilled with name/ID entry IDs). */
   evaluationFormUrl?: string;
-
   schedules?: EventSchedule[];
-
-  // Legacy fields - keep temporarily for older events
-  morningTimeIn?: string;
-  morningTimeOut?: string;
-  afternoonTimeIn?: string;
-  afternoonTimeOut?: string;
-  eveningTimeIn?: string;
-  eveningTimeOut?: string;
-
-  timeIn?: string;
-  timeOut?: string;
-}
-
-// A row synced from an event's evaluation Google Sheet (via Apps Script).
-// studentId/studentName are stored normalized (trim + lowercase).
-export interface EventEvaluation {
-  id: string;
-  eventId: string;
-  studentId: string;
-  studentName: string;
-  submittedAt: string;
 }
 
 // Attendance Types
@@ -159,15 +137,8 @@ export type UserRole =
   | "auditor"
   | "board-member";
 
-/** A catalog board member; account_user_id is optional for login access. */
-export interface BoardMember {
-  id: string;
-  name: string;
-  accountUserId?: string;
-}
-
 // Financial Summary Types
-export interface FinancialSummary {
+interface FinancialSummary {
   totalBudget: number;
   totalFundsCollected: number;
   totalFundsSpent: number;
@@ -175,7 +146,7 @@ export interface FinancialSummary {
   totalExpectedContributions: number;
 }
 
-export interface EventAllocation {
+interface EventAllocation {
   eventId: string;
   eventName: string;
   allocationAmount: number;
