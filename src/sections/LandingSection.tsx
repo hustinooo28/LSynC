@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ArrowRight, BadgeCheck, CalendarCheck, Eye, FileCheck2, Loader2, ReceiptText, ShieldCheck, UserRound, Wallet } from "lucide-react";
 import type { Student } from "@/types";
 import { studentsService } from "@/services/db";

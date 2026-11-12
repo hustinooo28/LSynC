@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, LayoutDashboard, LogIn, LogOut, Menu as MenuIcon, Moon, Sun, X } from "lucide-react";
 import type { UserRole, ViewState } from "@/types";
 import { ROLE_LABEL, VIEW_ROLES } from "@/lib/roles";

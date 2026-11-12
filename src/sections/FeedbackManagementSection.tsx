@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clock, EyeOff, Inbox, Lightbulb, MessageCircle, Trash2, User, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import type { FeedbackItem, UserRole } from "@/types";

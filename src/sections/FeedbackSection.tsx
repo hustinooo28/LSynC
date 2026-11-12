@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, EyeOff, Lightbulb, MessageCircle, Send, Shield, User } from "lucide-react";
 import { toast } from "sonner";
 import type { FeedbackItem, ViewState } from "@/types";

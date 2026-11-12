@@ -149,7 +149,7 @@ function InteractivePreview({ children, mediaControls = false }: { children: Rea
 }
 
 /** Inline preview for any requirement file (image, PDF, media, text, spreadsheet, office). */
-export default function FilePreview({ file }: { file: StudentRequirementFile }) {
+function FilePreview({ file }: { file: StudentRequirementFile }) {
   const kind = previewKind(file);
   const needsFetch = kind === "text" || kind === "sheet";
   // Tagged with the URL it was loaded from, so a stale result reads as "loading".

@@ -1,20 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
-/** Client-side pagination; resets to page 1 whenever the item list changes. */
+/** Client-side pagination; falls back to page 1 whenever the item list changes. */
 export function usePagination<T>(items: T[], pageSize = 10) {
-  const [page, setPage] = useState(1);
+  // Remember which list the chosen page belongs to, so a new list starts at 1
+  // without a reset effect.
+  const [state, setState] = useState({ page: 1, items });
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const page = state.items === items ? Math.min(state.page, totalPages) : 1;
 
-  useEffect(() => setPage(1), [items]);
-
-  const pageItems = useMemo(
-    () => items.slice((page - 1) * pageSize, page * pageSize),
-    [items, page, pageSize],
-  );
+  const pageItems = useMemo(() => items.slice((page - 1) * pageSize, page * pageSize), [items, page, pageSize]);
 
   return {
     pageItems,
     /** Spread onto <Pagination />. */
-    pagination: { page: Math.min(page, totalPages), totalPages, totalItems: items.length, pageSize, onPage: setPage },
+    pagination: { page, totalPages, totalItems: items.length, pageSize, onPage: (p: number) => setState({ page: p, items }) },
   };
 }

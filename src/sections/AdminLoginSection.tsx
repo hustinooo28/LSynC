@@ -1,4 +1,4 @@
-﻿import { useState } from "react";
+import { useState } from "react";
 import { ArrowRight, Shield } from "lucide-react";
 import { toast } from "sonner";
 import Field from "@/components/ui/Field";

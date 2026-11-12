@@ -1,4 +1,4 @@
-﻿import { Mail, MapPin, Phone, ShieldCheck } from "lucide-react";
+import { Mail, MapPin, Phone, ShieldCheck } from "lucide-react";
 import type { ViewState } from "@/types";
 
 interface FooterSectionProps {

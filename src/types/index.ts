@@ -138,7 +138,7 @@ export type UserRole =
   | "board-member";
 
 // Financial Summary Types
-export interface FinancialSummary {
+interface FinancialSummary {
   totalBudget: number;
   totalFundsCollected: number;
   totalFundsSpent: number;
@@ -146,7 +146,7 @@ export interface FinancialSummary {
   totalExpectedContributions: number;
 }
 
-export interface EventAllocation {
+interface EventAllocation {
   eventId: string;
   eventName: string;
   allocationAmount: number;

@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   ArrowRight,
   CalendarDays,

@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Edit2, FileSpreadsheet, Plus, QrCode, Trash2, UserPlus, Users } from "lucide-react";
 import type { Student } from "@/types";
