@@ -1,4 +1,4 @@
-﻿import { getSupabase } from "../lib/supabase";
+import { getSupabase } from "../lib/supabase";
 import { offlineSyncService } from "../lib/offlineSync";
 import { normalizeStudentName, splitSearchWords, escapeLikePattern } from "../lib/utils";
 import type {
@@ -377,8 +377,10 @@ const attendance = defineTable<AttendanceRecord>({
   order: { column: "date", ascending: false },
 });
 
-const attendanceQuery = (filter: (record: AttendanceRecord) => boolean, build: () => PromiseLike<{ data: Row[] | null; error: unknown }>) =>
-  cachedQuery("attendance", () => attendance.list(build()), filter).then((records) => records.sort(byDateDesc));
+const attendanceQuery = (
+  filter: (record: AttendanceRecord) => boolean,
+  build: () => PromiseLike<{ data: Row[] | null; error: unknown }>,
+) => cachedQuery("attendance", () => attendance.list(build()), filter).then((records) => records.sort(byDateDesc));
 
 export const attendanceService = {
   getAll: attendance.getAll,

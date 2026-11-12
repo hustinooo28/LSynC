@@ -114,25 +114,15 @@ const openDatabase = (): Promise<OfflineDatabase> =>
       reject(open.error ?? new Error("Could not open offline storage"));
   });
 
-const networkFailure = (error: unknown): boolean => {
-  let message = "";
+const errorMessage = (error: unknown): string =>
+  error instanceof Error
+    ? error.message
+    : typeof error === "object" && error !== null && "message" in error
+      ? String((error as { message: unknown }).message)
+      : String(error);
 
-  if (error instanceof Error) {
-    message = error.message;
-  } else if (
-    typeof error === "object" &&
-    error !== null &&
-    "message" in error
-  ) {
-    message = String((error as { message: unknown }).message);
-  } else {
-    message = String(error);
-  }
-
-  return /failed to fetch|network(?:error)?|offline|load failed|fetch failed|timeout/i.test(
-    message,
-  );
-};
+const networkFailure = (error: unknown): boolean =>
+  /failed to fetch|network(?:error)?|offline|load failed|fetch failed|timeout/i.test(errorMessage(error));
 
 /**
  * Officer-only offline cache and mutation queue.  The server remains the
@@ -202,11 +192,29 @@ class OfflineSyncService {
     this.listeners.forEach((listener) => listener());
   }
 
-  private async database(): Promise<OfflineDatabase> {
-    if (!hasIndexedDb)
-      throw new Error("Offline storage is not available in this browser.");
-    return openDatabase();
+  // One shared connection; opening a new one per call leaked connections.
+  private db: Promise<OfflineDatabase> | null = null;
+
+  private database(): Promise<OfflineDatabase> {
+    if (!hasIndexedDb())
+      return Promise.reject(new Error("Offline storage is not available in this browser."));
+    if (!this.db) {
+      this.db = openDatabase().then((database) => {
+        database.onclose = () => (this.db = null);
+        database.onversionchange = () => {
+          database.close();
+          this.db = null;
+        };
+        return database;
+      });
+      this.db.catch(() => (this.db = null));
+    }
+    return this.db;
   }
+
+  // Cache writes are read-modify-write; serialize them so concurrent
+  // mutations (e.g. a batched import) can't overwrite each other's records.
+  private cacheLock: Promise<unknown> = Promise.resolve();
 
   async read<T>(table: TableName): Promise<T[] | null> {
     if (!this.isEnabled() || !this.ownerId) return null;
@@ -234,7 +242,18 @@ class OfflineSyncService {
     await transactionDone(transaction);
   }
 
-  private async mutateCache<T>(
+  private mutateCache<T>(
+    table: TableName,
+    kind: MutationKind,
+    recordId: string,
+    makeLocal?: (current: T | undefined) => T,
+  ): Promise<T | undefined> {
+    const run = this.cacheLock.then(() => this.applyToCache(table, kind, recordId, makeLocal));
+    this.cacheLock = run.catch(() => undefined);
+    return run;
+  }
+
+  private async applyToCache<T>(
     table: TableName,
     kind: MutationKind,
     recordId: string,
@@ -325,6 +344,7 @@ class OfflineSyncService {
     makeLocal?: (current: T | undefined) => T;
     executeOnline: () => Promise<T>;
   }): Promise<T | undefined> {
+    const duringSync = this.syncInProgress;
     const queueOffline = async (): Promise<T | undefined> => {
       const local = await this.mutateCache<T>(
         params.table,
@@ -342,13 +362,21 @@ class OfflineSyncService {
         },
         params.fileStorage,
       );
-      this.state = "offline";
-      this.emit();
+      if (duringSync) {
+        // The running sync may already have drained the queue; make sure
+        // this write still gets sent.
+        if (!this.syncInProgress) void this.sync();
+      } else {
+        this.state = "offline";
+        this.emit();
+      }
       return local;
     };
 
     if (!this.isEnabled()) return params.executeOnline();
-    if (this.isOffline()) return queueOffline();
+    // While a replay is running, queue behind it so a new write can't reach
+    // Supabase before the queued writes it may depend on.
+    if (this.isOffline() || duringSync) return queueOffline();
     try {
       const result = await params.executeOnline();
       await this.mutateCache<T>(
@@ -441,7 +469,7 @@ class OfflineSyncService {
     transaction.objectStore("mutations").put({
       ...mutation,
       attempts: mutation.attempts + 1,
-      lastError: error instanceof Error ? error.message : String(error),
+      lastError: errorMessage(error),
     });
     await transactionDone(transaction);
   }
@@ -540,7 +568,8 @@ class OfflineSyncService {
     this.state = "syncing";
     this.emit();
     try {
-      for (const mutation of await this.queuedMutations()) {
+      // Re-read the queue each pass: writes made during sync are appended to it.
+      for (let mutation; (mutation = (await this.queuedMutations())[0]); ) {
         try {
           await this.replay(mutation);
           await this.removeMutation(mutation.key);
@@ -559,6 +588,8 @@ class OfflineSyncService {
     } finally {
       this.syncInProgress = false;
     }
+    // Catch writes queued while the last pass was finishing.
+    if (this.state === "synced" && (await this.pendingCount()) > 0) void this.sync();
   }
 }
 
