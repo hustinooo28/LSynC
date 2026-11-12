@@ -4,6 +4,7 @@ import type { Student } from "@/types";
 import { studentsService } from "@/services/db";
 import { cn } from "@/lib/utils";
 import LSCOfficerCarousel from "@/components/LSCOfficerCarousel";
+import FacebookFeed from "@/components/FacebookFeed";
 import SplitText from "@/components/motion/SplitText";
 import Reveal from "@/components/motion/Reveal";
 import { gsap, useGSAP, prefersReducedMotion } from "@/lib/gsap";
@@ -244,6 +245,8 @@ export default function LandingSection({ onSearch, onViewTransparency, searching
           </Reveal>
         </div>
       </section>
+
+      <FacebookFeed />
 
       {/* Council officers */}
       <section className="bg-page px-4 pb-20 sm:px-6 lg:pb-28">

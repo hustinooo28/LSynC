@@ -1,4 +1,5 @@
-import { Mail, MapPin, Phone, ShieldCheck } from "lucide-react";
+import { Facebook, Mail, MapPin, Phone, ShieldCheck } from "lucide-react";
+import { FACEBOOK_PAGE_URL } from "@/components/FacebookFeed";
 import type { ViewState } from "@/types";
 
 interface FooterSectionProps {
@@ -14,8 +15,9 @@ const LINKS: [string, ViewState][] = [
   ["Officer Login", "admin-login"],
 ];
 
-const CONTACT = [
-  { icon: Mail, label: "dsscsclsc@gmail.com" },
+const CONTACT: { icon: typeof Mail; label: string; href?: string }[] = [
+  { icon: Facebook, label: "facebook.com/dsscsclsc", href: FACEBOOK_PAGE_URL },
+  { icon: Mail, label: "dsscsclsc@gmail.com", href: "mailto:dsscsclsc@gmail.com" },
   { icon: Phone, label: "No number yet" },
   { icon: MapPin, label: "Student Council Office, Likod Sa SB 101" },
 ];
@@ -66,10 +68,16 @@ export default function FooterSection({ onNavigate }: FooterSectionProps) {
         <div>
           <Heading>Contact us</Heading>
           <ul className="space-y-3">
-            {CONTACT.map(({ icon: Icon, label }) => (
+            {CONTACT.map(({ icon: Icon, label, href }) => (
               <li key={label} className="flex items-start gap-2.5">
                 <Icon className="mt-0.5 h-4 w-4 shrink-0 text-brand-400" />
-                {label}
+                {href ? (
+                  <a href={href} target={href.startsWith("http") ? "_blank" : undefined} rel="noopener noreferrer" className="hover:text-white">
+                    {label}
+                  </a>
+                ) : (
+                  label
+                )}
               </li>
             ))}
           </ul>
